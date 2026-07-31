@@ -167,9 +167,6 @@ with st.sidebar:
         ["Dashboard", "New Assessment", "Assessment Details", "History / Reports", "Settings"],
         label_visibility="collapsed",
     )
-    st.markdown("---")
-    st.markdown("👤 **Operator: J. Tan**")
-    st.caption("🔔 3 new alerts")
 
 # ------------------------------------------------------------------
 # HELPERS
@@ -453,7 +450,7 @@ elif page == "History / Reports":
 elif page == "Settings":
     st.markdown("<div class='section-title'>Settings</div>", unsafe_allow_html=True)
 
-    tabs = st.tabs(["General", "Camera", "AI Model", "Quality Thresholds", "User Management"])
+    tabs = st.tabs(["General", "Camera", "AI Model", "Quality Thresholds"])
 
     with tabs[0]:
         st.text_input("System Name", value="FruitVision AI")
@@ -487,19 +484,6 @@ elif page == "Settings":
         st.write("**Defect Thresholds**")
         st.slider("Defect Warning Threshold (%)", 0, 100, 8)
         st.slider("Auto-Reject Threshold (%)", 0, 100, 20)
-
-    with tabs[4]:
-        users = pd.DataFrame(
-            {
-                "User": ["J. Tan", "M. Lee", "A. Kumar"],
-                "Role": ["Admin", "Operator", "Viewer"],
-                "Status": ["Active", "Active", "Inactive"],
-            }
-        )
-        st.dataframe(users, use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        c1.button("➕ Add User")
-        c2.button("🗑 Remove Selected User")
 
     st.write("")
     st.button("💾 Save Settings", type="primary")
