@@ -5,6 +5,7 @@ Requires:  pip install streamlit pandas numpy plotly pillow
 """
 
 import streamlit as st
+import cv2
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -12,6 +13,9 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import random
 import time
+
+from modules.preprocessing import ImagePreprocessor
+preprocessor = ImagePreprocessor()
 
 # ------------------------------------------------------------------
 # PAGE CONFIG
@@ -276,19 +280,37 @@ elif page == "New Assessment":
         uploaded = st.file_uploader("Drag & drop or browse (JPG, PNG, WebP)", type=["jpg", "jpeg", "png", "webp"])
         use_camera = st.camera_input("Or use your webcam")
         image_ready = uploaded is not None or use_camera is not None
-        if uploaded:
-            st.image(uploaded, caption="Preview", use_container_width=True)
-        elif use_camera:
-            st.image(use_camera, caption="Captured", use_container_width=True)
+        image = None
+        analyze_clicked = False
 
-        analyze_clicked = st.button("🔍 Analyze Fruit", type="primary", disabled=not image_ready,
-                                     use_container_width=True)
+        if uploaded:
+            file_bytes = np.asarray(
+                bytearray(uploaded.read()),
+                dtype=np.uint8
+            )
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        elif use_camera:
+            file_bytes = np.asarray(
+                bytearray(use_camera.read()),
+                dtype=np.uint8
+            )
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        analyze_clicked = st.button("🔍 Analyze Fruit", type="primary", disabled=not image_ready, use_container_width=True)
 
     with right:
         st.subheader("Real-Time Results")
         if not image_ready:
             st.markdown("_Upload or capture an image to begin analysis._")
         elif analyze_clicked:
+            start = time.time()
+            result = preprocessor.preprocess(image)
+            processing_time = time.time() - start
+            st.metric(
+                "Processing Time",
+                f"{processing_time:.3f} sec"
+            )
             progress = st.progress(0, text="Analyzing...")
             for pct in range(0, 101, 20):
                 time.sleep(0.15)
@@ -301,8 +323,79 @@ elif page == "New Assessment":
             severity = "Low" if defect_pct < 4 else ("Medium" if defect_pct < 9 else "High")
 
             with st.expander("Module 1: Image Preprocessing", expanded=True):
-                st.checkbox("Show preprocessed image", value=True, key="pp_toggle")
-                st.caption("Resized ✓ · Background removed ✓ · Contrast enhanced ✓")
+                st.info("""
+                ### 🔄 Image Processing Pipeline
+
+                📷 Image Acquisition  
+                ⬇️  
+                📏 Resize Image (224 × 224)  
+                ⬇️  
+                🎨 Convert BGR → HSV  
+                ⬇️  
+                🌫 Gaussian Filtering  
+                ⬇️  
+                ✨ Histogram Equalisation  
+                ⬇️  
+                🤖 Ready for Ripeness Classification
+                """)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("📷 Original Image")
+                    st.image(image, channels="BGR")
+                    st.caption(
+                        f"Resolution: {result['original_size'][1]} × {result['original_size'][0]}"
+                    )
+                    st.divider()
+                    st.subheader("📏 Resized Image")
+                    st.image(result["resized"], channels="BGR")
+                    st.caption(
+                        f"Resolution: {result['resized_size'][1]} × {result['resized_size'][0]}"
+                    )
+
+                with col2:
+                    st.subheader("🎨 HSV Channels")
+                    h1, h2, h3 = st.columns(3)
+                    with h1:
+                        st.image(result["hue"], clamp=True)
+                        st.caption("Hue (H)")
+
+                    with h2:
+                        st.image(result["saturation"], clamp=True)
+                        st.caption("Saturation (S)")
+
+                    with h3:
+                        st.image(result["value"], clamp=True)
+                        st.caption("Value (V)")
+
+                st.subheader("🌫 Gaussian Filtering")
+                st.image(
+                    cv2.cvtColor(result["gaussian"], cv2.COLOR_HSV2RGB)
+                )
+                st.caption(
+                    "Kernel Size: 5 × 5"
+                )
+                st.caption(
+                    "Gaussian blur reduces high-frequency image noise before feature extraction."
+                )
+
+                st.subheader("✨ Histogram Equalisation")
+                st.image(
+                    cv2.cvtColor(
+                        result["equalized"],
+                        cv2.COLOR_HSV2RGB
+                    )
+                )
+                st.metric(
+                    "Preprocessing Status",
+                    "Completed ✅"
+                )
+
+                st.caption(
+                """
+                The enhanced image has improved contrast and reduced noise,
+                making it suitable for the Ripeness Classification module.
+                """
+                )
 
             with st.expander("Module 2: Ripeness Classification", expanded=True):
                 st.markdown(ripeness_badge(ripeness), unsafe_allow_html=True)
@@ -331,6 +424,8 @@ elif page == "New Assessment":
             b1.button("📄 Generate Report", use_container_width=True)
             b2.button("💾 Save to History", use_container_width=True)
             b3.selectbox("Export as", ["PDF", "CSV", "JSON"], label_visibility="collapsed")
+
+            processed_image = result["equalized"]
         else:
             st.markdown("_Click **Analyze Fruit** to run the assessment._")
 
