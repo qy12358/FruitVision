@@ -1,7 +1,7 @@
 """
 FruitVision AI — Fruit Ripeness & Surface Quality Assessment System
 Run with:  streamlit run app.py
-Requires:  pip install streamlit pandas numpy plotly pillow
+Requires:  pip install streamlit pandas numpy plotly pillow opencv-python
 """
 
 import streamlit as st
@@ -15,7 +15,13 @@ import random
 import time
 
 from modules.preprocessing import ImagePreprocessor
+from modules.ripeness import RipenessClassifier
+
 preprocessor = ImagePreprocessor()
+# thresholds_path points to the file produced by calibrate_ripeness_thresholds.py.
+# If it doesn't exist yet, RipenessClassifier silently falls back to the
+# built-in DEFAULT_THRESHOLDS in modules/ripeness.py.
+ripeness_classifier = RipenessClassifier(thresholds_path="ripeness_thresholds.json")
 
 # ------------------------------------------------------------------
 # PAGE CONFIG
@@ -316,8 +322,6 @@ elif page == "New Assessment":
                 time.sleep(0.15)
                 progress.progress(pct, text="Analyzing..." if pct < 100 else "Done")
 
-            confidence = round(random.uniform(85, 99), 1)
-            ripeness = random.choice(RIPENESS_LEVELS)
             grade = random.choices(GRADES, weights=[40, 30, 20, 10])[0]
             defect_pct = round(random.uniform(0, 12), 1)
             severity = "Low" if defect_pct < 4 else ("Medium" if defect_pct < 9 else "High")
@@ -398,12 +402,44 @@ elif page == "New Assessment":
                 )
 
             with st.expander("Module 2: Ripeness Classification", expanded=True):
+                # HSV colour feature extraction is run on the Gaussian-filtered
+                # HSV image (denoised, but not yet histogram-equalised, since
+                # equalisation would distort the V-channel statistics used here).
+                ripeness_result = ripeness_classifier.analyze(
+                    result["gaussian"], fruit_type=fruit_type.lower()
+                )
+                ripeness = ripeness_result["ripeness"]
+                confidence = ripeness_result["confidence"]
+                feats = ripeness_result["features"]
+
                 st.markdown(ripeness_badge(ripeness), unsafe_allow_html=True)
                 st.metric("Confidence Score", f"{confidence}%")
                 st.progress(confidence / 100)
-                mc1, mc2 = st.columns(2)
-                mc1.metric("Color Value", round(random.uniform(0.4, 0.95), 2))
-                mc2.metric("Texture Score", round(random.uniform(0.5, 0.98), 2))
+
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Mean Hue (H)", round(feats["mean_hue"], 1))
+                mc2.metric("Mean Saturation (S)", round(feats["mean_saturation"], 1))
+                mc3.metric("Mean Value (V)", round(feats["mean_value"], 1))
+
+                st.caption(
+                    f"Green {feats['green_ratio']*100:.1f}% · "
+                    f"Yellow/Orange {feats['yellow_orange_ratio']*100:.1f}% · "
+                    f"Red {feats['red_ratio']*100:.1f}% · "
+                    f"Dark/Brown {(feats['dark_pixel_ratio']+feats['brown_pixel_ratio'])*100:.1f}%"
+                )
+
+                hist_fig = px.bar(
+                    x=list(range(len(feats["hist_hue"]))),
+                    y=feats["hist_hue"],
+                    labels={"x": "Hue bin", "y": "Proportion"},
+                    title="Hue Histogram (segmented fruit pixels)",
+                )
+                hist_fig.update_traces(marker_color=PRIMARY_LIGHT)
+                st.plotly_chart(hist_fig, use_container_width=True)
+
+                if ripeness_result["mask"] is not None:
+                    st.caption("Segmented foreground mask (used for feature extraction)")
+                    st.image(ripeness_result["mask"])
 
             with st.expander("Module 3: Surface Quality Grading", expanded=True):
                 st.markdown(grade_badge(grade), unsafe_allow_html=True)
