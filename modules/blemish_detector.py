@@ -1,75 +1,130 @@
-"""
-FruitVision AI
-Module 3 — Adaptive Mango Blemish & Damage Detection
-
-Detects:
-    - Small dark spots
-    - Large dark spots
-    - Brown lesions
-    - Bruises
-    - Rot-like regions
-    - Scratches
-    - Surface damage
-    - Large damaged / rotten areas
-
-Designed for:
-    - Random mango images
-    - Different mango sizes
-    - Different lighting conditions
-    - Green mangoes
-    - Yellow mangoes
-    - Ripe mangoes
-    - Pale mangoes
-    - Small blemishes
-    - Large blemishes
-    - Patchy damage
-    - Multiple damaged regions
-
-Attempts to ignore:
-    - Background
-    - Mango boundary
-    - Strong shadows
-    - Specular highlights
-    - Normal pale lenticels
-    - Tiny image noise
-    - Natural colour variation
-
-Input:
-    image      : OpenCV BGR image
-    mango_mask : Binary mango segmentation mask
-
-Output:
-    Dictionary compatible with app.py
-"""
-
 import cv2
 import numpy as np
 from typing import Dict, List, Tuple
 
 
 class BlemishDetector:
+    """
+    FruitVision AI
+    Module 3 — Small Mango Blemish & Damage Detection
+
+    FOCUS:
+        - Small dark / black spots
+        - Small brown blemishes
+        - Small surface damage
+        - Small scratches
+
+    INTENTIONALLY IGNORES:
+        - Large blemishes
+        - Large rot regions
+        - Large brown lesions
+        - Large decay regions
+        - Large connected damage
+        - Large edge damage
+
+    Overlay:
+        - Red detection only
+        - No putText()
+        - No labels
+        - No confidence text
+    """
 
     def __init__(
         self,
-        min_blemish_area=8,
-        boundary_erosion=10,
+
+        # ------------------------------------------------------------
+        # SMALL DEFECT LIMITS
+        # ------------------------------------------------------------
+
+        min_blemish_area: int = 3,
+
+        # IMPORTANT:
+        # Lower this if you want smaller detections.
+        # Increase slightly if too much noise is detected.
+        max_blemish_area: int = 700,
+
+        # Maximum bounding-box dimensions for a SMALL defect.
+        max_blemish_width: int = 60,
+        max_blemish_height: int = 60,
+
+        # A component cannot occupy more than this fraction
+        # of the mango safe area.
+        max_blemish_fraction: float = 0.025,
+
+        # Distance from mango boundary.
+        # Small defects near the boundary are ignored.
+        boundary_erosion: int = 7,
+
+        # ------------------------------------------------------------
+        # DETECTION SENSITIVITY
+        # ------------------------------------------------------------
+
+        dark_threshold_percentile: float = 12.0,
+        blackhat_percentile: float = 90.0,
+
+        # Small-scale blackhat only.
+        blackhat_sizes: Tuple[int, ...] = (
+            3,
+            5,
+            7,
+            9,
+            11,
+        ),
+
+        # Minimum confidence for a component.
+        confidence_threshold: float = 0.22,
     ):
-        """
-        Parameters
-        ----------
-        min_blemish_area : int
-            Minimum defect area in pixels.
 
-        boundary_erosion : int
-            Distance from mango boundary to ignore.
-        """
+        self.min_blemish_area = max(
+            1,
+            int(min_blemish_area)
+        )
 
-        self.min_blemish_area = max(2, int(min_blemish_area))
-        self.boundary_erosion = max(1, int(boundary_erosion))
+        self.max_blemish_area = max(
+            self.min_blemish_area + 1,
+            int(max_blemish_area)
+        )
 
-    # ==============================================================
+        self.max_blemish_width = max(
+            5,
+            int(max_blemish_width)
+        )
+
+        self.max_blemish_height = max(
+            5,
+            int(max_blemish_height)
+        )
+
+        self.max_blemish_fraction = float(
+            max_blemish_fraction
+        )
+
+        self.boundary_erosion = max(
+            1,
+            int(boundary_erosion)
+        )
+
+        self.dark_threshold_percentile = float(
+            dark_threshold_percentile
+        )
+
+        self.blackhat_percentile = float(
+            blackhat_percentile
+        )
+
+        self.blackhat_sizes = tuple(
+            int(x)
+            for x in blackhat_sizes
+            if int(x) >= 3
+        )
+
+        self.confidence_threshold = float(
+            confidence_threshold
+        )
+
+    # ================================================================
     # MAIN ANALYSIS
-    # ==============================================================
+    # ================================================================
 
     def analyze(
         self,
@@ -78,32 +133,42 @@ class BlemishDetector:
     ) -> Dict:
 
         if image is None:
-            raise ValueError("Input image is None.")
+            raise ValueError(
+                "Input image is None."
+            )
 
         if mango_mask is None:
-            raise ValueError("Mango mask is None.")
+            raise ValueError(
+                "Mango mask is None."
+            )
 
-        if image.size == 0:
-            raise ValueError("Input image is empty.")
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                "Input image must be a BGR image "
+                "with shape (H, W, 3)."
+            )
 
-        if mango_mask.size == 0:
-            raise ValueError("Mango mask is empty.")
-
-        # ----------------------------------------------------------
-        # 1. Resize image to segmentation mask
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Resize image to mask
+        # ------------------------------------------------------------
 
         mask_h, mask_w = mango_mask.shape[:2]
 
-        resized = cv2.resize(
-            image,
-            (mask_w, mask_h),
-            interpolation=cv2.INTER_AREA
-        )
+        if image.shape[:2] != (
+            mask_h,
+            mask_w
+        ):
+            image = cv2.resize(
+                image,
+                (mask_w, mask_h),
+                interpolation=cv2.INTER_AREA
+            )
 
-        # ----------------------------------------------------------
-        # 2. Make mask binary
-        # ----------------------------------------------------------
+        image = image.copy()
+
+        # ------------------------------------------------------------
+        # Binary mango mask
+        # ------------------------------------------------------------
 
         mask = np.where(
             mango_mask > 0,
@@ -111,445 +176,404 @@ class BlemishDetector:
             0
         ).astype(np.uint8)
 
-        # Remove tiny segmentation noise
         mask = self._clean_mango_mask(mask)
 
-        # ----------------------------------------------------------
-        # 3. Validate mango mask
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Safe mango area
+        # ------------------------------------------------------------
 
-        original_mango_area = cv2.countNonZero(mask)
+        safe_mask = self._make_safe_mask(
+            mask
+        )
 
-        if original_mango_area == 0:
+        if cv2.countNonZero(safe_mask) == 0:
             return self._empty_result(mask)
 
-        # ----------------------------------------------------------
-        # 4. Remove mango boundary
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Image preprocessing
+        # ------------------------------------------------------------
 
-        safe_mask = self._create_safe_mask(mask)
+        # Very light smoothing.
+        # Do NOT use aggressive blur because tiny blemishes
+        # can disappear.
+        denoised = cv2.GaussianBlur(
+            image,
+            (3, 3),
+            0
+        )
 
-        safe_area = cv2.countNonZero(safe_mask)
-
-        if safe_area == 0:
-            # If erosion removed everything, fall back to original mask
-            safe_mask = mask.copy()
-            safe_area = original_mango_area
-
-        # ----------------------------------------------------------
-        # 5. Colour spaces
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Color spaces
+        # ------------------------------------------------------------
 
         hsv = cv2.cvtColor(
-            resized,
+            denoised,
             cv2.COLOR_BGR2HSV
         )
 
         lab = cv2.cvtColor(
-            resized,
+            denoised,
             cv2.COLOR_BGR2LAB
         )
 
         gray = cv2.cvtColor(
-            resized,
+            denoised,
             cv2.COLOR_BGR2GRAY
         )
 
         H, S, V = cv2.split(hsv)
         L, A, B = cv2.split(lab)
 
-        # ----------------------------------------------------------
-        # 6. Illumination normalization
-        #
-        # Important:
-        # A shadow should not automatically become a defect.
-        #
-        # We calculate local brightness differences instead of
-        # relying only on absolute brightness.
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Local brightness
+        # ------------------------------------------------------------
 
-        gray_float = gray.astype(np.float32)
-
-        local_mean_small = cv2.GaussianBlur(
-            gray_float,
+        local_mean = cv2.GaussianBlur(
+            gray,
             (0, 0),
-            sigmaX=5
+            sigmaX=5,
+            sigmaY=5
         )
 
-        local_mean_large = cv2.GaussianBlur(
-            gray_float,
-            (0, 0),
-            sigmaX=15
+        local_mean = np.maximum(
+            local_mean.astype(np.float32),
+            1.0
         )
 
-        darkness_small = (
-            local_mean_small - gray_float
+        gray_float = gray.astype(
+            np.float32
         )
 
-        darkness_large = (
-            local_mean_large - gray_float
+        local_darkness = (
+            local_mean -
+            gray_float
         )
 
-        # ----------------------------------------------------------
-        # 7. Multi-scale blackhat
-        #
-        # Small kernel -> small blemishes
-        # Large kernel -> large blemishes
-        # ----------------------------------------------------------
+        normalized_darkness = (
+            local_darkness /
+            local_mean
+        )
 
-        blackhat = self._multi_scale_blackhat(gray)
+        # ------------------------------------------------------------
+        # SMALL-SCALE BLACKHAT
+        # ------------------------------------------------------------
 
-        # ----------------------------------------------------------
-        # 8. Adaptive statistics from the mango itself
-        # ----------------------------------------------------------
+        blackhat = self._small_scale_blackhat(
+            gray
+        )
 
-        fruit_pixels = safe_mask > 0
+        # ------------------------------------------------------------
+        # Mango statistics
+        # ------------------------------------------------------------
 
-        fruit_v = V[fruit_pixels]
-        fruit_s = S[fruit_pixels]
-        fruit_l = L[fruit_pixels]
-        fruit_blackhat = blackhat[fruit_pixels]
+        fruit_pixels = (
+            safe_mask > 0
+        )
 
-        if len(fruit_v) == 0:
+        fruit_v = V[
+            fruit_pixels
+        ].astype(np.float32)
+
+        fruit_s = S[
+            fruit_pixels
+        ].astype(np.float32)
+
+        fruit_a = A[
+            fruit_pixels
+        ].astype(np.float32)
+
+        fruit_b = B[
+            fruit_pixels
+        ].astype(np.float32)
+
+        fruit_blackhat = blackhat[
+            fruit_pixels
+        ].astype(np.float32)
+
+        if fruit_v.size == 0:
             return self._empty_result(mask)
 
-        # Robust statistics
-        v_median = float(np.median(fruit_v))
-        v_p10 = float(np.percentile(fruit_v, 10))
-        v_p20 = float(np.percentile(fruit_v, 20))
-        v_p80 = float(np.percentile(fruit_v, 80))
-
-        s_median = float(np.median(fruit_s))
-
-        bh_p85 = float(np.percentile(fruit_blackhat, 85))
-        bh_p90 = float(np.percentile(fruit_blackhat, 90))
-        bh_p95 = float(np.percentile(fruit_blackhat, 95))
-
+        # ------------------------------------------------------------
         # Adaptive thresholds
-        blackhat_threshold_small = max(
-            8.0,
-            bh_p90
+        # ------------------------------------------------------------
+
+        v10 = np.percentile(
+            fruit_v,
+            10
         )
 
-        blackhat_threshold_large = max(
-            12.0,
-            bh_p85
+        v20 = np.percentile(
+            fruit_v,
+            20
         )
 
-        # ----------------------------------------------------------
-        # 9. DETECTOR A
-        #
-        # Very dark / black spots
-        # ----------------------------------------------------------
-
-        dark_threshold = min(
-            110,
-            max(
-                45,
-                v_p20 - 12
-            )
+        v50 = np.percentile(
+            fruit_v,
+            50
         )
+
+        s40 = np.percentile(
+            fruit_s,
+            40
+        )
+
+        a50 = np.percentile(
+            fruit_a,
+            50
+        )
+
+        b50 = np.percentile(
+            fruit_b,
+            50
+        )
+
+        bh85 = np.percentile(
+            fruit_blackhat,
+            85
+        )
+
+        bh90 = np.percentile(
+            fruit_blackhat,
+            self.blackhat_percentile
+        )
+
+        # ------------------------------------------------------------
+        # 1. SMALL DARK SPOTS
+        # ------------------------------------------------------------
 
         dark_spots = (
-            (V < dark_threshold)
+            (V <= v10)
             &
             (
-                blackhat >
-                blackhat_threshold_small * 0.65
+                blackhat >= max(
+                    10,
+                    bh90
+                )
             )
             &
             (
-                darkness_small > 2
+                normalized_darkness >= 0.035
             )
         )
 
-        # ----------------------------------------------------------
-        # 10. DETECTOR B
-        #
-        # Adaptive dark regions
-        #
-        # Helps when the mango is generally bright but a region
-        # becomes significantly darker than its surroundings.
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # 2. SMALL BROWN BLEMISHES
+        # ------------------------------------------------------------
 
-        adaptive_dark = (
-            (darkness_large > 10)
+        blue = denoised[:, :, 0].astype(
+            np.int16
+        )
+
+        green = denoised[:, :, 1].astype(
+            np.int16
+        )
+
+        red = denoised[:, :, 2].astype(
+            np.int16
+        )
+
+        red_green = red - green
+        green_blue = green - blue
+
+        brown_color = (
+            (red_green > 2)
             &
-            (blackhat > blackhat_threshold_large * 0.50)
+            (green_blue > 0)
+        )
+
+        brown_lab = (
+            (A.astype(np.int16) >= a50)
             &
-            (V < max(175, v_median))
-        )
-
-        # ----------------------------------------------------------
-        # 11. DETECTOR C
-        #
-        # Brown / orange / bruised regions
-        #
-        # Uses:
-        # BGR relationships
-        # HSV saturation
-        # LAB colour difference
-        # ----------------------------------------------------------
-
-        blue = resized[:, :, 0].astype(np.int16)
-        green = resized[:, :, 1].astype(np.int16)
-        red = resized[:, :, 2].astype(np.int16)
-
-        brown_red_advantage = red - green
-        brown_green_advantage = green - blue
-
-        brown_condition_1 = (
-            brown_red_advantage > 2
-        )
-
-        brown_condition_2 = (
-            brown_green_advantage > -5
-        )
-
-        brown_condition_3 = (
-            A.astype(np.int16) > 128
-        )
-
-        brown_condition_4 = (
-            B.astype(np.int16) > 120
-        )
-
-        brown_condition_5 = (
-            S > 35
-        )
-
-        brown_condition_6 = (
-            V < 220
-        )
-
-        brown_condition_7 = (
-            darkness_small > 1
+            (B.astype(np.int16) >= b50)
         )
 
         brown_lesions = (
-            brown_condition_1
+            brown_color
             &
-            brown_condition_2
-            &
-            brown_condition_3
-            &
-            brown_condition_4
-            &
-            brown_condition_5
-            &
-            brown_condition_6
-            &
-            brown_condition_7
-        )
-
-        # ----------------------------------------------------------
-        # 12. DETECTOR D
-        #
-        # Strong brown / rotten patches
-        #
-        # More aggressive than the normal brown detector.
-        # ----------------------------------------------------------
-
-        strong_brown = (
-            (A.astype(np.int16) > 132)
-            &
-            (B.astype(np.int16) > 125)
-            &
-            (S > 45)
-            &
-            (V < 205)
+            brown_lab
             &
             (
-                blackhat >
-                blackhat_threshold_large * 0.45
+                S >
+                max(
+                    28,
+                    s40
+                )
+            )
+            &
+            (
+                (
+                    blackhat >
+                    max(
+                        8,
+                        bh85 * 0.65
+                    )
+                )
+                |
+                (
+                    local_darkness > 4
+                )
             )
         )
 
-        # ----------------------------------------------------------
-        # 13. DETECTOR E
-        #
-        # Very dark severe damage / rot
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # 3. SMALL VERY DARK DAMAGE
+        # ------------------------------------------------------------
 
         severe_dark = (
-            (V < 85)
-            &
-            (S > 15)
-            &
-            (
-                darkness_large > 7
-            )
-        )
-
-        # ----------------------------------------------------------
-        # 14. DETECTOR F
-        #
-        # Wet / decaying regions
-        #
-        # Rot does not always appear black.
-        # Some rotten areas are grey/brown and relatively bright.
-        # ----------------------------------------------------------
-
-        wet_rot = (
-            (V > 55)
-            &
-            (V < 190)
-            &
-            (S < 125)
-            &
-            (darkness_large > 12)
-            &
-            (
-                blackhat >
-                blackhat_threshold_large * 0.70
-            )
-        )
-
-        # ----------------------------------------------------------
-        # 15. DETECTOR G
-        #
-        # Local contrast anomaly
-        #
-        # Detects regions whose brightness differs strongly from
-        # their surrounding mango area.
-        # ----------------------------------------------------------
-
-        local_contrast = np.abs(
-            gray_float - local_mean_large
-        )
-
-        contrast_threshold = max(
-            10,
-            float(np.percentile(
-                local_contrast[fruit_pixels],
-                88
+            (V < max(
+                55,
+                v20 * 0.60
             ))
-        )
-
-        local_anomaly = (
-            (local_contrast > contrast_threshold)
+            &
+            (S > 18)
+            &
+            (normalized_darkness > 0.065)
             &
             (
                 blackhat >
-                blackhat_threshold_small * 0.40
+                max(
+                    10,
+                    bh90 * 0.70
+                )
             )
         )
 
-        # ----------------------------------------------------------
-        # 16. COMBINE DETECTORS
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # 4. SMALL WET / DARK SURFACE DAMAGE
+        # ------------------------------------------------------------
+
+        wet_damage = (
+            (V > 50)
+            &
+            (V < min(
+                185,
+                v50 + 20
+            ))
+            &
+            (S < 130)
+            &
+            (normalized_darkness > 0.075)
+            &
+            (
+                blackhat >
+                max(
+                    10,
+                    bh90 * 0.80
+                )
+            )
+        )
+
+        # ------------------------------------------------------------
+        # 5. SMALL SCRATCHES
+        # ------------------------------------------------------------
+
+        scratch_mask = self._detect_small_scratches(
+            gray,
+            safe_mask
+        )
+
+        # ------------------------------------------------------------
+        # 6. VERY SMALL WHITE/FUZZY SURFACE DAMAGE
+        # ------------------------------------------------------------
+
+        # Keep this conservative.
+        # Large white regions will be removed later by the
+        # component-size filter.
+        white_surface = (
+            (V > 175)
+            &
+            (S < 65)
+            &
+            (blackhat > 12)
+            &
+            (normalized_darkness > 0.025)
+        )
+
+        # ------------------------------------------------------------
+        # COMBINE
+        # ------------------------------------------------------------
 
         candidate = (
             dark_spots
             |
-            adaptive_dark
-            |
             brown_lesions
-            |
-            strong_brown
             |
             severe_dark
             |
-            wet_rot
+            wet_damage
             |
-            local_anomaly
+            scratch_mask
+            |
+            white_surface
         )
 
-        candidate &= fruit_pixels
+        candidate &= (
+            safe_mask > 0
+        )
 
-        # ----------------------------------------------------------
-        # 17. REMOVE SPECULAR HIGHLIGHTS
-        #
-        # Very bright + low saturation regions are normally glare.
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Remove obvious highlights
+        # ------------------------------------------------------------
 
-        specular_highlight = (
+        highlights = (
             (V > 225)
             &
-            (S < 75)
-        )
-
-        # Only remove if there is no strong evidence of darkness
-        safe_highlight_removal = (
-            specular_highlight
+            (S < 85)
             &
-            (darkness_large < 12)
+            (normalized_darkness < 0.05)
         )
 
-        candidate &= ~safe_highlight_removal
+        candidate &= ~highlights
 
-        # ----------------------------------------------------------
-        # 18. REMOVE NORMAL PALE LENTICELS
-        #
-        # Lenticels are generally:
-        # bright
-        # small
-        # low saturation
-        # weak blackhat response
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Remove normal pale lenticels
+        # ------------------------------------------------------------
 
         normal_lenticels = (
-            (V > max(160, v_p80))
+            (V > max(
+                150,
+                v50
+            ))
             &
-            (S < 95)
+            (S < 105)
             &
-            (blackhat < blackhat_threshold_small * 0.65)
+            (normalized_darkness < 0.05)
             &
-            (darkness_small < 5)
+            (
+                blackhat <
+                max(
+                    9,
+                    bh85 * 0.65
+                )
+            )
         )
 
         candidate &= ~normal_lenticels
 
-        # ----------------------------------------------------------
-        # 19. Remove weak global shadows
-        #
-        # A large shadow should not automatically be classified as
-        # damage.
-        #
-        # We retain regions having strong local anomaly evidence.
-        # ----------------------------------------------------------
-
-        shadow_like = (
-            (V < 80)
-            &
-            (S < 70)
-            &
-            (blackhat < blackhat_threshold_small * 0.55)
-            &
-            (darkness_large < 8)
-        )
-
-        candidate &= ~shadow_like
-
-        # ----------------------------------------------------------
-        # 20. Convert to binary mask
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Morphological cleaning
+        # ------------------------------------------------------------
 
         damage_mask = (
-            candidate.astype(np.uint8) * 255
+            candidate.astype(
+                np.uint8
+            ) * 255
         )
 
-        # ----------------------------------------------------------
-        # 21. Morphological cleanup
-        #
-        # IMPORTANT:
-        # We use a very small opening so small blemishes are NOT
-        # destroyed.
-        # ----------------------------------------------------------
-
-        small_kernel = cv2.getStructuringElement(
+        # Very small opening.
+        # Larger opening would destroy tiny blemishes.
+        open_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (2, 2)
+            (3, 3)
         )
 
         damage_mask = cv2.morphologyEx(
             damage_mask,
             cv2.MORPH_OPEN,
-            small_kernel,
-            iterations=1
+            open_kernel
         )
 
-        # Fill small gaps
+        # Small closing to connect fragmented pixels.
         close_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (3, 3)
@@ -558,219 +582,30 @@ class BlemishDetector:
         damage_mask = cv2.morphologyEx(
             damage_mask,
             cv2.MORPH_CLOSE,
-            close_kernel,
-            iterations=1
+            close_kernel
         )
 
-        # ----------------------------------------------------------
-        # 22. Connected component analysis
-        # ----------------------------------------------------------
+        damage_mask[
+            safe_mask == 0
+        ] = 0
 
-        num_labels, labels, stats, centroids = (
-            cv2.connectedComponentsWithStats(
-                damage_mask,
-                connectivity=8
+        # ------------------------------------------------------------
+        # SMALL COMPONENT FILTER
+        # ------------------------------------------------------------
+
+        cleaned_mask, components = (
+            self._filter_small_components(
+                damage_mask=damage_mask,
+                safe_mask=safe_mask,
+                hsv=hsv,
+                blackhat=blackhat,
+                normalized_darkness=normalized_darkness
             )
         )
 
-        cleaned_mask = np.zeros_like(damage_mask)
-
-        components = []
-
-        # ----------------------------------------------------------
-        # 23. Boundary safety guard
-        # ----------------------------------------------------------
-
-        guard_kernel = np.ones(
-            (3, 3),
-            dtype=np.uint8
-        )
-
-        safety_guard = cv2.erode(
-            safe_mask,
-            guard_kernel,
-            iterations=1
-        )
-
-        # ----------------------------------------------------------
-        # 24. Process every detected region
-        # ----------------------------------------------------------
-
-        for i in range(1, num_labels):
-
-            area = int(
-                stats[i, cv2.CC_STAT_AREA]
-            )
-
-            x = int(
-                stats[i, cv2.CC_STAT_LEFT]
-            )
-
-            y = int(
-                stats[i, cv2.CC_STAT_TOP]
-            )
-
-            w = int(
-                stats[i, cv2.CC_STAT_WIDTH]
-            )
-
-            h = int(
-                stats[i, cv2.CC_STAT_HEIGHT]
-            )
-
-            # Ignore very tiny noise
-            if area < self.min_blemish_area:
-                continue
-
-            component_mask = (
-                labels == i
-            )
-
-            # ------------------------------------------------------
-            # Check distance from mango boundary
-            # ------------------------------------------------------
-
-            touching_boundary = np.any(
-                component_mask &
-                (safety_guard == 0)
-            )
-
-            if touching_boundary:
-                continue
-
-            # ------------------------------------------------------
-            # Calculate component properties
-            # ------------------------------------------------------
-
-            perimeter = cv2.arcLength(
-                cv2.findContours(
-                    component_mask.astype(np.uint8),
-                    cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE
-                )[0][0],
-                True
-            ) if area > 0 else 0
-
-            circularity = (
-                (4 * np.pi * area) /
-                (perimeter * perimeter)
-                if perimeter > 0
-                else 0
-            )
-
-            aspect_ratio = (
-                max(w, h) /
-                max(1, min(w, h))
-            )
-
-            fill_ratio = (
-                area /
-                max(1, w * h)
-            )
-
-            # ------------------------------------------------------
-            # Component pixel statistics
-            # ------------------------------------------------------
-
-            pixels = component_mask
-
-            mean_v = float(
-                np.mean(V[pixels])
-            )
-
-            mean_s = float(
-                np.mean(S[pixels])
-            )
-
-            mean_h = float(
-                np.mean(H[pixels])
-            )
-
-            mean_blackhat = float(
-                np.mean(blackhat[pixels])
-            )
-
-            mean_darkness = float(
-                np.mean(darkness_large[pixels])
-            )
-
-            mean_a = float(
-                np.mean(A[pixels])
-            )
-
-            mean_b = float(
-                np.mean(B[pixels])
-            )
-
-            # ------------------------------------------------------
-            # Add component
-            # ------------------------------------------------------
-
-            cleaned_mask[component_mask] = 255
-
-            components.append(
-                {
-                    "area": area,
-                    "x": x,
-                    "y": y,
-                    "width": w,
-                    "height": h,
-
-                    "aspect_ratio": round(
-                        float(aspect_ratio),
-                        2
-                    ),
-
-                    "circularity": round(
-                        float(circularity),
-                        3
-                    ),
-
-                    "fill_ratio": round(
-                        float(fill_ratio),
-                        3
-                    ),
-
-                    "mean_h": round(
-                        mean_h,
-                        2
-                    ),
-
-                    "mean_s": round(
-                        mean_s,
-                        2
-                    ),
-
-                    "mean_v": round(
-                        mean_v,
-                        2
-                    ),
-
-                    "mean_blackhat": round(
-                        mean_blackhat,
-                        2
-                    ),
-
-                    "mean_darkness": round(
-                        mean_darkness,
-                        2
-                    ),
-
-                    "mean_lab_a": round(
-                        mean_a,
-                        2
-                    ),
-
-                    "mean_lab_b": round(
-                        mean_b,
-                        2
-                    ),
-                }
-            )
-
-        # ----------------------------------------------------------
-        # 25. Recalculate damage area
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Area
+        # ------------------------------------------------------------
 
         mango_area = cv2.countNonZero(
             safe_mask
@@ -780,52 +615,46 @@ class BlemishDetector:
             cleaned_mask
         )
 
-        if mango_area > 0:
-            defect_percentage = (
-                damage_area /
-                mango_area
-            ) * 100.0
-        else:
-            defect_percentage = 0.0
-
-        defect_percentage = min(
-            max(defect_percentage, 0.0),
+        defect_percentage = (
+            damage_area /
+            mango_area *
             100.0
+            if mango_area > 0
+            else 0.0
         )
 
-        # ----------------------------------------------------------
-        # 26. Classify defect types
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Classification
+        # ------------------------------------------------------------
 
         defect_types = self.classify_defects(
-            resized,
-            cleaned_mask,
-            components
+            image=denoised,
+            damage_mask=cleaned_mask,
+            components=components
         )
 
-        # ----------------------------------------------------------
-        # 27. Severity and quality grade
-        #
-        # The grading is based on actual damaged surface area.
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Grade
+        # ------------------------------------------------------------
 
-        severity, grade = self._calculate_grade(
-            defect_percentage
+        severity, grade = (
+            self._calculate_grade(
+                defect_percentage
+            )
         )
 
-        # ----------------------------------------------------------
-        # 28. Create overlay
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Overlay
+        # ------------------------------------------------------------
 
         overlay = self._create_overlay(
-            resized,
-            cleaned_mask,
-            components
+            denoised,
+            cleaned_mask
         )
 
-        # ----------------------------------------------------------
-        # 29. Return result
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Return
+        # ------------------------------------------------------------
 
         return {
             "defect_percentage": round(
@@ -847,7 +676,6 @@ class BlemishDetector:
             ),
 
             "severity": severity,
-
             "grade": grade,
 
             "defect_types": defect_types,
@@ -865,11 +693,50 @@ class BlemishDetector:
             "safe_mango_mask": safe_mask,
 
             "blackhat": blackhat,
+
+            # Debug masks
+            "candidate_mask": damage_mask,
+
+            "dark_spots": (
+                dark_spots.astype(
+                    np.uint8
+                ) * 255
+            ),
+
+            "brown_lesions": (
+                brown_lesions.astype(
+                    np.uint8
+                ) * 255
+            ),
+
+            "severe_dark": (
+                severe_dark.astype(
+                    np.uint8
+                ) * 255
+            ),
+
+            "wet_damage": (
+                wet_damage.astype(
+                    np.uint8
+                ) * 255
+            ),
+
+            "scratch_mask": (
+                scratch_mask.astype(
+                    np.uint8
+                ) * 255
+            ),
+
+            "white_surface": (
+                white_surface.astype(
+                    np.uint8
+                ) * 255
+            ),
         }
 
-    # ==============================================================
-    # MANGO MASK CLEANING
-    # ==============================================================
+    # ================================================================
+    # CLEAN MANGO MASK
+    # ================================================================
 
     def _clean_mango_mask(
         self,
@@ -884,18 +751,15 @@ class BlemishDetector:
         cleaned = cv2.morphologyEx(
             mask,
             cv2.MORPH_CLOSE,
-            kernel,
-            iterations=2
+            kernel
         )
 
         cleaned = cv2.morphologyEx(
             cleaned,
             cv2.MORPH_OPEN,
-            kernel,
-            iterations=1
+            kernel
         )
 
-        # Keep largest connected object
         num_labels, labels, stats, _ = (
             cv2.connectedComponentsWithStats(
                 cleaned,
@@ -906,92 +770,61 @@ class BlemishDetector:
         if num_labels <= 1:
             return cleaned
 
-        largest_label = 1
-        largest_area = stats[
-            1,
-            cv2.CC_STAT_AREA
-        ]
+        largest = (
+            1 +
+            np.argmax(
+                stats[
+                    1:,
+                    cv2.CC_STAT_AREA
+                ]
+            )
+        )
 
-        for i in range(2, num_labels):
-
-            area = stats[
-                i,
-                cv2.CC_STAT_AREA
-            ]
-
-            if area > largest_area:
-                largest_area = area
-                largest_label = i
-
-        result = np.zeros_like(cleaned)
+        result = np.zeros_like(
+            mask
+        )
 
         result[
-            labels == largest_label
+            labels == largest
         ] = 255
 
         return result
 
-    # ==============================================================
+    # ================================================================
     # SAFE MANGO MASK
-    # ==============================================================
+    # ================================================================
 
-    def _create_safe_mask(
+    def _make_safe_mask(
         self,
         mask: np.ndarray
     ) -> np.ndarray:
 
-        h, w = mask.shape
-
-        # Adaptive boundary erosion
-        #
-        # Do not use a huge kernel on a small mango.
-        mango_area = cv2.countNonZero(mask)
-
-        mango_radius = max(
-            1,
-            int(
-                np.sqrt(mango_area / np.pi)
-            )
-        )
-
-        erosion_pixels = min(
-            self.boundary_erosion,
-            max(
-                1,
-                int(mango_radius * 0.06)
-            )
-        )
-
-        kernel_size = (
-            erosion_pixels * 2 + 1
-        )
-
-        kernel_size = max(
+        erosion = max(
             3,
-            min(kernel_size, 21)
+            int(self.boundary_erosion)
         )
+
+        if erosion % 2 == 0:
+            erosion += 1
 
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
-            (
-                kernel_size,
-                kernel_size
-            )
+            (erosion, erosion)
         )
 
-        safe_mask = cv2.erode(
+        safe = cv2.erode(
             mask,
             kernel,
             iterations=1
         )
 
-        return safe_mask
+        return safe
 
-    # ==============================================================
-    # MULTI-SCALE BLACKHAT
-    # ==============================================================
+    # ================================================================
+    # SMALL-SCALE BLACKHAT
+    # ================================================================
 
-    def _multi_scale_blackhat(
+    def _small_scale_blackhat(
         self,
         gray: np.ndarray
     ) -> np.ndarray:
@@ -1000,17 +833,15 @@ class BlemishDetector:
             gray
         )
 
-        # Small -> medium -> large blemishes
-        kernel_sizes = [
-            5,
-            7,
-            11,
-            15,
-            21,
-            31
-        ]
+        # IMPORTANT:
+        # No 15x15 or 21x21.
+        #
+        # This prevents large blemishes from becoming
+        # strong candidates.
+        for size in self.blackhat_sizes:
 
-        for size in kernel_sizes:
+            if size % 2 == 0:
+                size += 1
 
             kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE,
@@ -1030,9 +861,534 @@ class BlemishDetector:
 
         return blackhat
 
-    # ==============================================================
-    # DEFECT CLASSIFICATION
-    # ==============================================================
+    # ================================================================
+    # SMALL SCRATCH DETECTION
+    # ================================================================
+
+    def _detect_small_scratches(
+        self,
+        gray: np.ndarray,
+        safe_mask: np.ndarray
+    ) -> np.ndarray:
+
+        # ------------------------------------------------------------
+        # Small horizontal scratch
+        # ------------------------------------------------------------
+
+        horizontal_kernel = (
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (9, 3)
+            )
+        )
+
+        horizontal = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_BLACKHAT,
+            horizontal_kernel
+        )
+
+        # ------------------------------------------------------------
+        # Small vertical scratch
+        # ------------------------------------------------------------
+
+        vertical_kernel = (
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (3, 9)
+            )
+        )
+
+        vertical = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_BLACKHAT,
+            vertical_kernel
+        )
+
+        response = np.maximum(
+            horizontal,
+            vertical
+        )
+
+        fruit_response = response[
+            safe_mask > 0
+        ]
+
+        if fruit_response.size == 0:
+            return np.zeros_like(
+                gray,
+                dtype=bool
+            )
+
+        threshold = max(
+            20,
+            np.percentile(
+                fruit_response,
+                97
+            )
+        )
+
+        scratch = (
+            (response >= threshold)
+            &
+            (safe_mask > 0)
+        )
+
+        scratch_u8 = (
+            scratch.astype(
+                np.uint8
+            ) * 255
+        )
+
+        # Very light cleaning
+        scratch_u8 = cv2.morphologyEx(
+            scratch_u8,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (3, 3)
+            )
+        )
+
+        return scratch_u8 > 0
+
+    # ================================================================
+    # SMALL COMPONENT FILTER
+    # ================================================================
+
+    def _filter_small_components(
+        self,
+        damage_mask: np.ndarray,
+        safe_mask: np.ndarray,
+        hsv: np.ndarray,
+        blackhat: np.ndarray,
+        normalized_darkness: np.ndarray
+    ) -> Tuple[
+        np.ndarray,
+        List[Dict]
+    ]:
+
+        H, S, V = cv2.split(
+            hsv
+        )
+
+        num_labels, labels, stats, _ = (
+            cv2.connectedComponentsWithStats(
+                damage_mask,
+                connectivity=8
+            )
+        )
+
+        cleaned = np.zeros_like(
+            damage_mask
+        )
+
+        components = []
+
+        mango_area = cv2.countNonZero(
+            safe_mask
+        )
+
+        # ------------------------------------------------------------
+        # IMPORTANT:
+        # Everything above this area is rejected.
+        #
+        # There is NO exception for large rot.
+        # ------------------------------------------------------------
+
+        for i in range(
+            1,
+            num_labels
+        ):
+
+            area = int(
+                stats[
+                    i,
+                    cv2.CC_STAT_AREA
+                ]
+            )
+
+            # --------------------------------------------------------
+            # Too small
+            # --------------------------------------------------------
+
+            if area < self.min_blemish_area:
+                continue
+
+            # --------------------------------------------------------
+            # TOO LARGE -> ALWAYS REJECT
+            # --------------------------------------------------------
+
+            if area > self.max_blemish_area:
+                continue
+
+            x = int(
+                stats[
+                    i,
+                    cv2.CC_STAT_LEFT
+                ]
+            )
+
+            y = int(
+                stats[
+                    i,
+                    cv2.CC_STAT_TOP
+                ]
+            )
+
+            w = int(
+                stats[
+                    i,
+                    cv2.CC_STAT_WIDTH
+                ]
+            )
+
+            h = int(
+                stats[
+                    i,
+                    cv2.CC_STAT_HEIGHT
+                ]
+            )
+
+            # --------------------------------------------------------
+            # Bounding box size
+            # --------------------------------------------------------
+
+            if w > self.max_blemish_width:
+                continue
+
+            if h > self.max_blemish_height:
+                continue
+
+            # --------------------------------------------------------
+            # Mango-relative size
+            # --------------------------------------------------------
+
+            if mango_area > 0:
+
+                fraction = (
+                    area /
+                    mango_area
+                )
+
+                if fraction > self.max_blemish_fraction:
+                    continue
+
+            # --------------------------------------------------------
+            # Component pixels
+            # --------------------------------------------------------
+
+            component_pixels = (
+                labels == i
+            )
+
+            # --------------------------------------------------------
+            # Small defects must be away from the mango edge.
+            #
+            # This prevents background/shadow/edge regions from
+            # being mistaken as small damage.
+            # --------------------------------------------------------
+
+            if np.any(
+                component_pixels &
+                (safe_mask == 0)
+            ):
+                continue
+
+            # --------------------------------------------------------
+            # Shape
+            # --------------------------------------------------------
+
+            aspect_ratio = (
+                max(w, h) /
+                max(
+                    1,
+                    min(w, h)
+                )
+            )
+
+            bbox_area = max(
+                1,
+                w * h
+            )
+
+            fill_ratio = (
+                area /
+                bbox_area
+            )
+
+            contour = (
+                self._component_contour(
+                    component_pixels
+                )
+            )
+
+            perimeter = cv2.arcLength(
+                contour,
+                True
+            )
+
+            circularity = (
+                4.0 *
+                np.pi *
+                area /
+                (perimeter ** 2)
+                if perimeter > 0
+                else 0.0
+            )
+
+            # --------------------------------------------------------
+            # Pixel statistics
+            # --------------------------------------------------------
+
+            mean_v = float(
+                np.mean(
+                    V[
+                        component_pixels
+                    ]
+                )
+            )
+
+            mean_s = float(
+                np.mean(
+                    S[
+                        component_pixels
+                    ]
+                )
+            )
+
+            mean_blackhat = float(
+                np.mean(
+                    blackhat[
+                        component_pixels
+                    ]
+                )
+            )
+
+            mean_darkness = float(
+                np.mean(
+                    normalized_darkness[
+                        component_pixels
+                    ]
+                )
+            )
+
+            # --------------------------------------------------------
+            # Confidence
+            # --------------------------------------------------------
+
+            confidence = (
+                self._component_confidence(
+                    area=area,
+                    aspect_ratio=aspect_ratio,
+                    fill_ratio=fill_ratio,
+                    circularity=circularity,
+                    mean_v=mean_v,
+                    mean_s=mean_s,
+                    mean_blackhat=mean_blackhat,
+                    mean_darkness=mean_darkness
+                )
+            )
+
+            if confidence < self.confidence_threshold:
+                continue
+
+            # --------------------------------------------------------
+            # Keep
+            # --------------------------------------------------------
+
+            cleaned[
+                component_pixels
+            ] = 255
+
+            components.append({
+
+                "area": area,
+
+                "x": x,
+                "y": y,
+                "width": w,
+                "height": h,
+
+                "aspect_ratio": round(
+                    float(aspect_ratio),
+                    3
+                ),
+
+                "fill_ratio": round(
+                    float(fill_ratio),
+                    3
+                ),
+
+                "circularity": round(
+                    float(circularity),
+                    3
+                ),
+
+                "mean_v": round(
+                    mean_v,
+                    2
+                ),
+
+                "mean_s": round(
+                    mean_s,
+                    2
+                ),
+
+                "mean_blackhat": round(
+                    mean_blackhat,
+                    2
+                ),
+
+                "mean_darkness": round(
+                    mean_darkness,
+                    4
+                ),
+
+                "confidence": round(
+                    float(confidence),
+                    3
+                )
+            })
+
+        return (
+            cleaned,
+            components
+        )
+
+    # ================================================================
+    # COMPONENT CONTOUR
+    # ================================================================
+
+    def _component_contour(
+        self,
+        component_mask: np.ndarray
+    ):
+
+        temp = (
+            component_mask.astype(
+                np.uint8
+            ) * 255
+        )
+
+        contours, _ = cv2.findContours(
+            temp,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if not contours:
+            return np.array(
+                [[[0, 0]]],
+                dtype=np.int32
+            )
+
+        return max(
+            contours,
+            key=cv2.contourArea
+        )
+
+    # ================================================================
+    # COMPONENT CONFIDENCE
+    # ================================================================
+
+    def _component_confidence(
+        self,
+        area: int,
+        aspect_ratio: float,
+        fill_ratio: float,
+        circularity: float,
+        mean_v: float,
+        mean_s: float,
+        mean_blackhat: float,
+        mean_darkness: float
+    ) -> float:
+
+        score = 0.0
+
+        # ------------------------------------------------------------
+        # Small defects get enough score
+        # ------------------------------------------------------------
+
+        if area >= 30:
+            score += 0.15
+
+        elif area >= 15:
+            score += 0.10
+
+        else:
+            score += 0.08
+
+        # ------------------------------------------------------------
+        # Darkness
+        # ------------------------------------------------------------
+
+        score += min(
+            0.28,
+            mean_darkness * 2.0
+        )
+
+        # ------------------------------------------------------------
+        # Blackhat
+        # ------------------------------------------------------------
+
+        score += min(
+            0.28,
+            mean_blackhat / 100.0
+        )
+
+        # ------------------------------------------------------------
+        # Saturation
+        # ------------------------------------------------------------
+
+        if mean_s > 55:
+            score += 0.12
+
+        elif mean_s > 35:
+            score += 0.07
+
+        # ------------------------------------------------------------
+        # Scratch shape
+        # ------------------------------------------------------------
+
+        if aspect_ratio > 4:
+            score += 0.12
+
+        elif aspect_ratio > 2:
+            score += 0.06
+
+        # ------------------------------------------------------------
+        # Compact spot
+        # ------------------------------------------------------------
+
+        if circularity > 0.20:
+            score += 0.05
+
+        if fill_ratio > 0.25:
+            score += 0.04
+
+        # ------------------------------------------------------------
+        # Bright weak region suppression
+        # ------------------------------------------------------------
+
+        if (
+            mean_v > 220
+            and
+            mean_blackhat < 20
+        ):
+            score *= 0.30
+
+        return float(
+            np.clip(
+                score,
+                0.0,
+                1.0
+            )
+        )
+
+    # ================================================================
+    # CLASSIFICATION
+    # ================================================================
 
     def classify_defects(
         self,
@@ -1049,18 +1405,13 @@ class BlemishDetector:
             cv2.COLOR_BGR2HSV
         )
 
-        lab = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2LAB
+        H, S, V = cv2.split(
+            hsv
         )
 
-        H, S, V = cv2.split(hsv)
-        L, A, B = cv2.split(lab)
-
         scratch_found = False
-        rot_found = False
-        bruise_found = False
-        dark_spot_found = False
+        dark_found = False
+        brown_found = False
         surface_found = False
 
         for comp in components:
@@ -1071,140 +1422,117 @@ class BlemishDetector:
             h = comp["height"]
             area = comp["area"]
 
-            aspect_ratio = comp[
+            aspect = comp[
                 "aspect_ratio"
             ]
 
-            circularity = comp[
-                "circularity"
-            ]
-
-            mean_v = comp[
-                "mean_v"
-            ]
-
-            mean_s = comp[
-                "mean_s"
-            ]
-
-            mean_a = comp[
-                "mean_lab_a"
-            ]
-
-            mean_b = comp[
-                "mean_lab_b"
-            ]
-
-            mean_darkness = comp[
-                "mean_darkness"
-            ]
-
-            mean_blackhat = comp[
-                "mean_blackhat"
-            ]
-
-            # ------------------------------------------------------
-            # Scratch detection
-            # ------------------------------------------------------
+            # --------------------------------------------------------
+            # Scratch
+            # --------------------------------------------------------
 
             if (
-                aspect_ratio >= 4.0
-                and area >= 10
+                (
+                    aspect >= 4.0
+                    or
+                    aspect <= 0.25
+                )
+                and
+                area >= 10
             ):
                 scratch_found = True
+                continue
 
-            # Also detect thinner scratches
-            elif (
-                aspect_ratio >= 3.0
-                and area >= 15
-                and circularity < 0.45
-            ):
-                scratch_found = True
+            # --------------------------------------------------------
+            # Component region
+            # --------------------------------------------------------
 
-            # ------------------------------------------------------
-            # Very dark region
-            # ------------------------------------------------------
-
-            if (
-                mean_v < 75
-                and mean_darkness > 5
-            ):
-                dark_spot_found = True
-
-            # ------------------------------------------------------
-            # Rot detection
-            # ------------------------------------------------------
-
-            if (
-                mean_v < 95
-                and mean_darkness > 8
-                and mean_blackhat > 8
-            ):
-                rot_found = True
-
-            # Large rotten regions
-            if (
-                area > 300
-                and mean_darkness > 10
-                and mean_v < 150
-            ):
-                rot_found = True
-
-            # ------------------------------------------------------
-            # Bruise / brown lesion
-            # ------------------------------------------------------
-
-            brown_like = (
-                mean_a > 128
-                and mean_b > 120
-                and mean_s > 30
+            region = np.zeros_like(
+                damage_mask
             )
 
-            if brown_like:
-                bruise_found = True
+            region[
+                y:y + h,
+                x:x + w
+            ] = damage_mask[
+                y:y + h,
+                x:x + w
+            ]
 
-            # ------------------------------------------------------
-            # Generic surface defect
-            # ------------------------------------------------------
+            pixels = (
+                region > 0
+            )
+
+            if not np.any(pixels):
+                continue
+
+            actual_v = float(
+                np.mean(
+                    V[pixels]
+                )
+            )
+
+            actual_s = float(
+                np.mean(
+                    S[pixels]
+                )
+            )
+
+            actual_darkness = (
+                comp[
+                    "mean_darkness"
+                ]
+            )
+
+            # --------------------------------------------------------
+            # Dark small spot
+            # --------------------------------------------------------
 
             if (
-                area >= self.min_blemish_area
+                actual_v < 90
+                or
+                actual_darkness > 0.13
             ):
+                dark_found = True
+
+            # --------------------------------------------------------
+            # Brown blemish
+            # --------------------------------------------------------
+
+            elif actual_s > 45:
+                brown_found = True
+
+            # --------------------------------------------------------
+            # Other small surface damage
+            # --------------------------------------------------------
+
+            else:
                 surface_found = True
 
         defect_types = []
 
+        if dark_found:
+            defect_types.append(
+                "Small Dark Spot"
+            )
+
+        if brown_found:
+            defect_types.append(
+                "Small Brown Blemish"
+            )
+
         if scratch_found:
             defect_types.append(
-                "Scratch"
+                "Small Scratch"
             )
 
-        if rot_found:
+        if surface_found:
             defect_types.append(
-                "Rot / Dark Lesion"
-            )
-
-        if bruise_found:
-            defect_types.append(
-                "Bruise / Brown Spot"
-            )
-
-        if dark_spot_found and not rot_found:
-            defect_types.append(
-                "Dark Spot"
-            )
-
-        if (
-            not defect_types
-            and surface_found
-        ):
-            defect_types.append(
-                "Surface Blemish"
+                "Small Surface Damage"
             )
 
         if not defect_types:
             defect_types.append(
-                "None"
+                "Small Surface Blemish"
             )
 
         return list(
@@ -1213,80 +1541,71 @@ class BlemishDetector:
             )
         )
 
-    # ==============================================================
-    # SEVERITY / GRADE
-    # ==============================================================
+    # ================================================================
+    # GRADE
+    # ================================================================
 
     def _calculate_grade(
         self,
         defect_percentage: float
     ) -> Tuple[str, str]:
 
-        """
-        Surface quality grading:
+        if defect_percentage < 0.5:
 
-        < 2%      -> A
-        2 - <5%   -> B
-        5 - <10%  -> C
-        >=10%     -> D
-        """
-
-        if defect_percentage < 2:
             return "Low", "A"
 
-        elif defect_percentage < 5:
+        elif defect_percentage < 1.5:
+
+            return "Low", "A"
+
+        elif defect_percentage < 3.0:
+
             return "Medium", "B"
 
-        elif defect_percentage < 10:
+        elif defect_percentage < 5.0:
+
             return "Medium", "C"
 
         else:
+
             return "High", "D"
 
-    # ==============================================================
+    # ================================================================
     # OVERLAY
-    # ==============================================================
+    # ================================================================
 
     def _create_overlay(
         self,
         image: np.ndarray,
-        damage_mask: np.ndarray,
-        components: List[Dict]
+        damage_mask: np.ndarray
     ) -> np.ndarray:
 
         overlay = image.copy()
 
-        # ----------------------------------------------------------
-        # Red transparent defect area
-        # ----------------------------------------------------------
-
-        red_layer = np.zeros_like(
-            image
-        )
-
-        red_layer[:, :, 2] = 255
-
-        damage_pixels = (
+        # Red detection.
+        overlay[
             damage_mask > 0
+        ] = (
+            0,
+            0,
+            255
         )
 
-        overlay[damage_pixels] = (
-            (
-                overlay[damage_pixels]
-                .astype(np.float32)
-                * 0.45
-            )
-            +
-            (
-                red_layer[damage_pixels]
-                .astype(np.float32)
-                * 0.55
-            )
-        ).astype(np.uint8)
+        result = cv2.addWeighted(
+            image,
+            0.72,
+            overlay,
+            0.28,
+            0
+        )
 
-        # ----------------------------------------------------------
-        # Draw contours
-        # ----------------------------------------------------------
+        # ------------------------------------------------------------
+        # Only contours.
+        #
+        # NO putText()
+        # NO labels
+        # NO confidence
+        # ------------------------------------------------------------
 
         contours, _ = cv2.findContours(
             damage_mask,
@@ -1295,52 +1614,18 @@ class BlemishDetector:
         )
 
         cv2.drawContours(
-            overlay,
+            result,
             contours,
             -1,
             (0, 0, 255),
-            2
+            1
         )
 
-        # ----------------------------------------------------------
-        # Draw bounding boxes
-        # ----------------------------------------------------------
+        return result
 
-        for index, comp in enumerate(
-            components,
-            start=1
-        ):
-
-            x = comp["x"]
-            y = comp["y"]
-            w = comp["width"]
-            h = comp["height"]
-
-            cv2.rectangle(
-                overlay,
-                (x, y),
-                (x + w, y + h),
-                (0, 0, 255),
-                1
-            )
-
-            # Component number
-            cv2.putText(
-                overlay,
-                str(index),
-                (x, max(12, y - 3)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.35,
-                (0, 0, 255),
-                1,
-                cv2.LINE_AA
-            )
-
-        return overlay
-
-    # ==============================================================
+    # ================================================================
     # EMPTY RESULT
-    # ==============================================================
+    # ================================================================
 
     def _empty_result(
         self,
@@ -1348,6 +1633,7 @@ class BlemishDetector:
     ) -> Dict:
 
         return {
+
             "defect_percentage": 0.0,
 
             "damage_percentage": 0.0,
@@ -1360,7 +1646,9 @@ class BlemishDetector:
 
             "grade": "A",
 
-            "defect_types": ["None"],
+            "defect_types": [
+                "None"
+            ],
 
             "component_count": 0,
 
@@ -1375,6 +1663,34 @@ class BlemishDetector:
             "safe_mango_mask": mask,
 
             "blackhat": np.zeros_like(
+                mask
+            ),
+
+            "candidate_mask": np.zeros_like(
+                mask
+            ),
+
+            "dark_spots": np.zeros_like(
+                mask
+            ),
+
+            "brown_lesions": np.zeros_like(
+                mask
+            ),
+
+            "severe_dark": np.zeros_like(
+                mask
+            ),
+
+            "wet_damage": np.zeros_like(
+                mask
+            ),
+
+            "scratch_mask": np.zeros_like(
+                mask
+            ),
+
+            "white_surface": np.zeros_like(
                 mask
             ),
         }
