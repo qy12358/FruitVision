@@ -17,9 +17,13 @@ import time
 
 from modules.preprocessing import ImagePreprocessor
 from modules.ripeness_classifier import HybridRipenessClassifier
+from modules.blemish_detector import BlemishDetector
 
 preprocessor = ImagePreprocessor()
-
+blemish_detector = BlemishDetector(
+    min_blemish_area=8,
+    boundary_erosion=15
+)
 
 @st.cache_resource
 def load_ripeness_classifier() -> HybridRipenessClassifier:
@@ -62,7 +66,7 @@ def split_histogram_dict(colour_histogram: dict):
 # ------------------------------------------------------------------
 st.set_page_config(
     page_title="FruitVision AI",
-    page_icon="🍎",
+    page_icon="🥭",  # Changed to Mango icon
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -322,7 +326,7 @@ history_df = generate_history()
 # ------------------------------------------------------------------
 with st.sidebar:
     st.markdown(
-        "<div class='logo-text'>🍎 FruitVision AI</div>",
+        "<div class='logo-text'>🥭 FruitVision AI</div>",  # Changed to Mango icon
         unsafe_allow_html=True,
     )
     st.caption("Snap a photo of a mango — get instant ripeness, quality and defect results.")
@@ -425,6 +429,30 @@ def empty_state(icon: str, title: str, subtitle: str):
     )
 
 
+# Generate Report Helper Function
+def generate_report_string(fruit_type, batch_id, ripeness, confidence, grade, defect_pct, severity, defect_types):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report = f"""# FruitVision AI - Inspection Report
+
+**Assessment ID:** FR-{datetime.now().strftime('%Y%m%d%H%M%S')}
+**Date & Time:** {timestamp}
+**Batch ID:** {batch_id}
+**Fruit Type:** {fruit_type}
+
+## Analysis Results
+* **Predicted Ripeness:** {ripeness if ripeness else "N/A"}
+* **Confidence Level:** {confidence:.1f}%
+* **Surface Quality Grade:** {grade}
+* **Defect Percentage:** {defect_pct:.2f}%
+* **Severity:** {severity}
+* **Defect Types Detected:** {', '.join(defect_types) if defect_types else 'None'}
+
+---
+*This report was generated automatically by FruitVision AI.*
+"""
+    return report
+
+
 # ------------------------------------------------------------------
 # PAGE 1: DASHBOARD
 # ------------------------------------------------------------------
@@ -439,7 +467,14 @@ if page == "Dashboard":
     with c2:
         st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
         st.markdown("<div class='metric-title'>Ripeness Distribution</div>", unsafe_allow_html=True)
-        pie_df = history_df["Ripeness"].value_counts().reset_index()
+        
+        # Calculate and display exact percentages inside the card
+        dist = history_df["Ripeness"].value_counts()
+        total = len(history_df)
+        pct_str = "  |  ".join([f"{k}: {v/total*100:.1f}%" for k, v in dist.items()])
+        st.caption(pct_str)
+        
+        pie_df = dist.reset_index()
         pie_df.columns = ["Ripeness", "Count"]
         fig = px.pie(
             pie_df, names="Ripeness", values="Count", hole=0.55,
@@ -506,309 +541,353 @@ elif page == "New Assessment":
             help="Used to group fruits scanned together, e.g. from the same crate.",
         )
 
-    st.write("")
-    left, right = st.columns(2)
+    st.divider()
 
-    with left:
-        st.subheader("📷 Photo")
-        upload_tab, camera_tab = st.tabs(["📁 Upload Photo", "📷 Use Camera"])
-        with upload_tab:
-            uploaded = st.file_uploader(
-                "Drag & drop or browse (JPG, PNG, WebP)",
-                type=["jpg", "jpeg", "png", "webp"],
-            )
-        with camera_tab:
-            use_camera = st.camera_input("Take a photo")
-
-        if uploaded and use_camera:
-            st.caption("You've provided both a file and a photo — using the uploaded file.")
-
-        image_ready = uploaded is not None or use_camera is not None
-        image = None
-        analyze_clicked = False
-
-        if uploaded:
-            file_bytes = np.asarray(
-                bytearray(uploaded.read()),
-                dtype=np.uint8
-            )
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-        elif use_camera:
-            file_bytes = np.asarray(
-                bytearray(use_camera.read()),
-                dtype=np.uint8
-            )
-            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-        st.write("")
-        analyze_clicked = st.button(
-            "🔍 Analyze Fruit",
-            type="primary",
-            disabled=not image_ready,
-            use_container_width=True,
+    # === STEP 1: PHOTO UPLOAD ===
+    st.subheader("📷 Step 1: Upload Photo")
+    upload_tab, camera_tab = st.tabs(["📁 Upload Photo", "📷 Use Camera"])
+    with upload_tab:
+        uploaded = st.file_uploader(
+            "Drag & drop or browse (JPG, PNG, WebP)",
+            type=["jpg", "jpeg", "png", "webp"],
         )
-        if not image_ready:
-            st.caption("Upload a photo or use your camera above to enable analysis.")
+    with camera_tab:
+        use_camera = st.camera_input("Take a photo")
 
-    with right:
-        st.subheader("Results")
+    if uploaded and use_camera:
+        st.caption("You've provided both a file and a photo — using the uploaded file.")
 
-        current_step = 3 if analyze_clicked else (2 if image_ready else 1)
-        step_indicator(current_step)
+    image_ready = uploaded is not None or use_camera is not None
+    image = None
+    analyze_clicked = False
 
-        if not image_ready:
-            empty_state(
-                "📸",
-                "No photo yet",
-                "Upload a photo or use your camera on the left to get started.",
+    if uploaded:
+        file_bytes = np.asarray(
+            bytearray(uploaded.read()),
+            dtype=np.uint8
+        )
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    elif use_camera:
+        file_bytes = np.asarray(
+            bytearray(use_camera.read()),
+            dtype=np.uint8
+        )
+        image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    st.write("")
+    analyze_clicked = st.button(
+        "🔍 Analyze Fruit",
+        type="primary",
+        disabled=not image_ready,
+        use_container_width=True,
+    )
+    if not image_ready:
+        st.caption("Upload a photo or use your camera above to enable analysis.")
+
+    st.divider()
+
+    # === STEP 2: RESULTS ===
+    st.subheader("📊 Step 2: Analysis Results")
+
+    current_step = 3 if analyze_clicked else (2 if image_ready else 1)
+    step_indicator(current_step)
+
+    if not image_ready:
+        empty_state(
+            "📸",
+            "No photo yet",
+            "Upload a photo or use your camera above to get started.",
+        )
+    elif not analyze_clicked:
+        empty_state(
+            "🔍",
+            "Ready when you are",
+            "Click **Analyze Fruit** above to run the AI assessment.",
+        )
+    elif analyze_clicked:
+        start = time.time()
+        result = preprocessor.preprocess(image)
+        preprocessing_time = time.time() - start
+
+        with st.spinner("Detecting blemishes and surface damage..."):
+            blemish_result = blemish_detector.analyze(
+                image=image,
+                mango_mask=result["mask"]
             )
-        elif not analyze_clicked:
-            empty_state(
-                "🔍",
-                "Ready when you are",
-                "Click **Analyze Fruit** on the left to run the AI assessment.",
+
+        defect_pct = blemish_result["defect_percentage"]
+        severity = blemish_result["severity"]
+        grade = blemish_result["grade"]
+        defect_types = blemish_result["defect_types"]
+
+        mango_pixel_count = int(cv2.countNonZero(result["mask"]))
+        total_pixel_count = result["mask"].shape[0] * result["mask"].shape[1]
+
+        # ==========================================================
+        # === MODULE 2: HYBRID RIPENESS CLASSIFICATION ===
+        # ==========================================================
+        ripeness = None
+        confidence = 0.0
+        raw_ripeness = None
+        classification_error = None
+        probabilities = {}
+        hsv_features = {}
+        statistical_analysis = {}
+        colour_histogram = {}
+        feature_count = 0
+        inference_time_ms = 0.0
+
+        try:
+            classifier = load_ripeness_classifier()
+        except FileNotFoundError as e:
+            classification_error = str(e)
+        else:
+            with st.spinner("Analyzing your photo..."):
+                ripeness_result = classifier.predict(
+                    result["segmented"], mask=result["mask"]
+                )
+
+            raw_prediction = ripeness_result["prediction"]
+            prediction = format_class_label(raw_prediction)
+            confidence = ripeness_result["confidence"]
+            probabilities = ripeness_result["probabilities"]
+            hsv_features = ripeness_result["hsv_features"]
+            statistical_analysis = ripeness_result["statistical_analysis"]
+            colour_histogram = ripeness_result["colour_histogram"]
+            feature_count = ripeness_result["feature_count"]
+            inference_time_ms = ripeness_result["inference_time_ms"]
+
+            ripeness = prediction
+            raw_ripeness = raw_prediction
+
+        if classification_error:
+            st.error(classification_error)
+            st.caption(
+                "Run `python training/train_model.py` to generate "
+                "`models/efficientnet_fruit.keras` and "
+                "`models/class_indices.json`, then rerun the app."
             )
-        elif analyze_clicked:
-            start = time.time()
-            result = preprocessor.preprocess(image)
-            preprocessing_time = time.time() - start
+        else:
+            # ---- HERO RESULT CARD --------------------------------
+            icon, advice = RIPENESS_ADVICE.get(prediction, ("ℹ️", ""))
+            hero_color = RIPENESS_COLORS.get(prediction, PRIMARY)
+            st.markdown(
+                f"""
+                <div class="hero-card" style="--hero-color:{hero_color};">
+                    <div class="hero-title">Predicted ripeness</div>
+                    {ripeness_badge(prediction)}
+                    <div class="hero-advice">{icon} {advice}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            grade = random.choices(GRADES, weights=[40, 30, 20, 10])[0]
-            defect_pct = round(random.uniform(0, 12), 1)
-            severity = "Low" if defect_pct < 4 else ("Medium" if defect_pct < 9 else "High")
-
-            mango_pixel_count = int(cv2.countNonZero(result["mask"]))
-            total_pixel_count = result["mask"].shape[0] * result["mask"].shape[1]
-
-            # ==========================================================
-            # === MODULE 2: HYBRID RIPENESS CLASSIFICATION ===
-            # ==========================================================
-            # EfficientNetB0 deep visual features + a 63-value colour/
-            # statistical feature vector (6 HSV stats + 48-bin colour
-            # histogram + 9 statistical measures) are fused and
-            # classified by a single trained dense head — the
-            # relationship between these features and ripeness is
-            # LEARNED, not hard-coded anywhere in this pipeline.
-            #
-            # Both branches read from result["segmented"] (the HSV image
-            # with background zeroed out) + result["mask"], so background
-            # pixels never contaminate the mango's colour statistics.
-            ripeness = None
-            raw_ripeness = None
-            classification_error = None
-
-            try:
-                classifier = load_ripeness_classifier()
-            except FileNotFoundError as e:
-                classification_error = str(e)
-            else:
-                with st.spinner("Analyzing your photo..."):
-                    ripeness_result = classifier.predict(
-                        result["segmented"], mask=result["mask"]
-                    )
-
-                raw_prediction = ripeness_result["prediction"]
-                prediction = format_class_label(raw_prediction)
-                confidence = ripeness_result["confidence"]
-                probabilities = ripeness_result["probabilities"]
-                hsv_features = ripeness_result["hsv_features"]
-                statistical_analysis = ripeness_result["statistical_analysis"]
-                colour_histogram = ripeness_result["colour_histogram"]
-                feature_count = ripeness_result["feature_count"]
-                inference_time_ms = ripeness_result["inference_time_ms"]
-
-                ripeness = prediction
-                raw_ripeness = raw_prediction
-
-            if classification_error:
-                st.error(classification_error)
-                st.caption(
-                    "Run `python training/train_model.py` to generate "
-                    "`models/efficientnet_fruit.keras` and "
-                    "`models/class_indices.json`, then rerun the app."
+            gc1, gc2 = st.columns([1, 1])
+            with gc1:
+                st.plotly_chart(
+                    confidence_gauge(confidence, prediction),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
                 )
-            else:
-                # ---- HERO RESULT CARD --------------------------------
-                icon, advice = RIPENESS_ADVICE.get(prediction, ("ℹ️", ""))
-                hero_color = RIPENESS_COLORS.get(prediction, PRIMARY)
-                st.markdown(
-                    f"""
-                    <div class="hero-card" style="--hero-color:{hero_color};">
-                        <div class="hero-title">Predicted ripeness</div>
-                        {ripeness_badge(prediction)}
-                        <div class="hero-advice">{icon} {advice}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+                st.caption("Model confidence")
+            with gc2:
+                st.image(result["segmented_rgb"], caption="What the AI focused on")
+
+        # ==========================================================
+        # === ACTIONS (SAVE / REPORT) ===
+        # ==========================================================
+        st.write("")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            report_text = generate_report_string(
+                fruit_type, batch_id, ripeness, confidence, grade,
+                defect_pct, severity, defect_types
+            )
+            st.download_button(
+                label="📄 Generate Report",
+                data=report_text,
+                file_name=f"FR-{datetime.now().strftime('%Y%m%d%H%M%S')}_report.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+        with b2:
+            if st.button("💾 Save to History", use_container_width=True):
+                new_id = f"FR-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                st.session_state.saved_assessments.append(
+                    {
+                        "ID": new_id,
+                        "Fruit Type": fruit_type,
+                        "Ripeness": ripeness,
+                        "Grade": grade,
+                        "Defect %": defect_pct,
+                        "Date": datetime.now(),
+                    }
                 )
+                st.success(f"Saved as {new_id} — view it in History / Reports.")
+        with b3:
+            st.selectbox("Export as", ["PDF", "CSV", "JSON"], label_visibility="collapsed")
 
-                gc1, gc2 = st.columns([1, 1])
-                with gc1:
-                    st.plotly_chart(
-                        confidence_gauge(confidence, prediction),
-                        use_container_width=True,
-                        config={"displayModeBar": False},
-                    )
-                    st.caption("Model confidence")
-                with gc2:
-                    st.image(result["segmented_rgb"], caption="What the AI focused on")
+        # ---- TECHNICAL DETAILS (collapsed by default) --------
+        st.write("")
+        st.markdown("##### Want to see how we got this result?")
 
-                st.write("")
-                b1, b2, b3 = st.columns(3)
-                with b1:
-                    st.button("📄 Generate Report", use_container_width=True)
-                with b2:
-                    if st.button("💾 Save to History", use_container_width=True):
-                        new_id = f"FR-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                        st.session_state.saved_assessments.append(
-                            {
-                                "ID": new_id,
-                                "Fruit Type": fruit_type,
-                                "Ripeness": ripeness,
-                                "Grade": grade,
-                                "Defect %": defect_pct,
-                                "Date": datetime.now(),
-                            }
-                        )
-                        st.success(f"Saved as {new_id} — view it in History / Reports.")
-                with b3:
-                    st.selectbox("Export as", ["PDF", "CSV", "JSON"], label_visibility="collapsed")
-
-                st.write("")
-                st.markdown(
-                    f"**Surface grade:** {grade_badge(grade)} &nbsp;·&nbsp; "
-                    f"**Defects:** {defect_pct}% ({severity} severity)"
-                    f"<span class='chip'>🚧 preview — module not yet implemented</span>",
-                    unsafe_allow_html=True,
+        with st.expander("🖼️ Image preprocessing"):
+            st.caption(
+                f"Resize → BGR→HSV → Gaussian filter → "
+                f"{result['contrast_method']} contrast enhancement → "
+                f"HSV segmentation → morphological cleanup → largest "
+                f"connected component. Preprocessing took "
+                f"{preprocessing_time:.3f}s."
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(image, channels="BGR", caption="Original")
+                st.image(result["resized"], channels="BGR", caption="Resized (224×224)")
+            with col2:
+                st.image(
+                    result["mask"], clamp=True,
+                    caption="Segmentation mask (white = mango)",
+                )
+                st.image(
+                    result["segmented_rgb"],
+                    caption="Background removed",
+                )
+            st.metric(
+                "Mango Pixels Detected",
+                f"{mango_pixel_count:,} / {total_pixel_count:,} "
+                f"({mango_pixel_count / total_pixel_count * 100:.1f}%)"
+            )
+            if mango_pixel_count < 0.02 * total_pixel_count:
+                st.warning(
+                    "⚠️ Very few mango pixels detected — segmentation may have "
+                    "failed for this image. The ripeness result above may be "
+                    "unreliable."
                 )
 
-                # ---- TECHNICAL DETAILS (collapsed by default) --------
-                st.write("")
-                st.markdown("##### Want to see how we got this result?")
+        with st.expander("🧪 Ripeness features (HSV, colour, statistics)"):
+            st.caption(
+                "These numbers are fed into the trained AI model as learned "
+                "inputs — they are not manually mapped to ripeness classes "
+                "using fixed rules."
+            )
+            st.markdown("**Probability by class**")
+            sorted_probs = sorted(
+                probabilities.items(), key=lambda kv: kv[1], reverse=True
+            )
+            display_labels = [format_class_label(c) for c, _ in sorted_probs]
+            prob_fig = go.Figure(
+                data=[
+                    go.Bar(
+                        x=display_labels,
+                        y=[v for _, v in sorted_probs],
+                        marker_color=[
+                            RIPENESS_COLORS.get(label, PRIMARY_LIGHT)
+                            for label in display_labels
+                        ],
+                        text=[f"{v:.1f}%" for _, v in sorted_probs],
+                        textposition="outside",
+                    )
+                ]
+            )
+            prob_fig.update_layout(
+                yaxis_title="Probability (%)",
+                yaxis_range=[0, 100],
+                height=280,
+                margin=dict(t=10, b=20),
+            )
+            st.plotly_chart(prob_fig, use_container_width=True)
 
-                with st.expander("🖼️ Image preprocessing"):
-                    st.caption(
-                        f"Resize → BGR→HSV → Gaussian filter → "
-                        f"{result['contrast_method']} contrast enhancement → "
-                        f"HSV segmentation → morphological cleanup → largest "
-                        f"connected component. Preprocessing took "
-                        f"{preprocessing_time:.3f}s."
-                    )
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.image(image, channels="BGR", caption="Original")
-                        st.image(result["resized"], channels="BGR", caption="Resized (224×224)")
-                    with col2:
-                        st.image(
-                            result["mask"], clamp=True,
-                            caption="Segmentation mask (white = mango)",
-                        )
-                        st.image(
-                            result["segmented_rgb"],
-                            caption="Background removed",
-                        )
-                    st.metric(
-                        "Mango Pixels Detected",
-                        f"{mango_pixel_count:,} / {total_pixel_count:,} "
-                        f"({mango_pixel_count / total_pixel_count * 100:.1f}%)"
-                    )
-                    if mango_pixel_count < 0.02 * total_pixel_count:
-                        st.warning(
-                            "⚠️ Very few mango pixels detected — segmentation may have "
-                            "failed for this image. The ripeness result above may be "
-                            "unreliable."
-                        )
+            st.markdown("**HSV statistics (mean / std / median)**")
+            hv1, hv2, hv3 = st.columns(3)
+            hv1.metric("Hue", f"{hsv_features['mean_h']:.1f}",
+                        help=f"std {hsv_features['std_h']:.1f}, "
+                             f"median {statistical_analysis['median_h']:.1f}")
+            hv2.metric("Saturation", f"{hsv_features['mean_s']:.1f}",
+                        help=f"std {hsv_features['std_s']:.1f}, "
+                             f"median {statistical_analysis['median_s']:.1f}")
+            hv3.metric("Value", f"{hsv_features['mean_v']:.1f}",
+                        help=f"std {hsv_features['std_v']:.1f}, "
+                             f"median {statistical_analysis['median_v']:.1f}")
 
-                with st.expander("🧪 Ripeness features (HSV, colour, statistics)"):
-                    st.caption(
-                        "These numbers are fed into the trained AI model as learned "
-                        "inputs — they are not manually mapped to ripeness classes "
-                        "using fixed rules."
-                    )
-                    st.markdown("**Probability by class**")
-                    sorted_probs = sorted(
-                        probabilities.items(), key=lambda kv: kv[1], reverse=True
-                    )
-                    display_labels = [format_class_label(c) for c, _ in sorted_probs]
-                    prob_fig = go.Figure(
-                        data=[
-                            go.Bar(
-                                x=display_labels,
-                                y=[v for _, v in sorted_probs],
-                                marker_color=[
-                                    RIPENESS_COLORS.get(label, PRIMARY_LIGHT)
-                                    for label in display_labels
-                                ],
-                                text=[f"{v:.1f}%" for _, v in sorted_probs],
-                                textposition="outside",
-                            )
-                        ]
-                    )
-                    prob_fig.update_layout(
-                        yaxis_title="Probability (%)",
-                        yaxis_range=[0, 100],
-                        height=280,
-                        margin=dict(t=10, b=20),
-                    )
-                    st.plotly_chart(prob_fig, use_container_width=True)
+            st.markdown("**Colour histogram (48 features)**")
+            h_vals, s_vals, v_vals = split_histogram_dict(colour_histogram)
+            hist_fig = make_subplots(
+                rows=1, cols=3,
+                subplot_titles=("Hue", "Saturation", "Value"),
+            )
+            hist_fig.add_trace(
+                go.Bar(x=list(range(16)), y=h_vals, marker_color=PRIMARY), row=1, col=1
+            )
+            hist_fig.add_trace(
+                go.Bar(x=list(range(16)), y=s_vals, marker_color=SECONDARY), row=1, col=2
+            )
+            hist_fig.add_trace(
+                go.Bar(x=list(range(16)), y=v_vals, marker_color=PRIMARY_LIGHT), row=1, col=3
+            )
+            hist_fig.update_layout(height=260, showlegend=False, margin=dict(t=40, b=20))
+            hist_fig.update_xaxes(title_text="Bin")
+            hist_fig.update_yaxes(title_text="Proportion", row=1, col=1)
+            st.plotly_chart(hist_fig, use_container_width=True)
 
-                    st.markdown("**HSV statistics (mean / std / median)**")
-                    hv1, hv2, hv3 = st.columns(3)
-                    hv1.metric("Hue", f"{hsv_features['mean_h']:.1f}",
-                                help=f"std {hsv_features['std_h']:.1f}, "
-                                     f"median {statistical_analysis['median_h']:.1f}")
-                    hv2.metric("Saturation", f"{hsv_features['mean_s']:.1f}",
-                                help=f"std {hsv_features['std_s']:.1f}, "
-                                     f"median {statistical_analysis['median_s']:.1f}")
-                    hv3.metric("Value", f"{hsv_features['mean_v']:.1f}",
-                                help=f"std {hsv_features['std_v']:.1f}, "
-                                     f"median {statistical_analysis['median_v']:.1f}")
+            st.markdown("**Model information**")
+            mi1, mi2, mi3, mi4 = st.columns(4)
+            mi1.metric("Architecture", "EfficientNetB0 + Fusion")
+            mi2.metric("Inputs", f"224×224 + {feature_count} feats")
+            mi3.metric("Classes", str(len(probabilities)))
+            mi4.metric("Inference", f"{inference_time_ms:.1f} ms")
 
-                    st.markdown("**Colour histogram (48 features)**")
-                    h_vals, s_vals, v_vals = split_histogram_dict(colour_histogram)
-                    hist_fig = make_subplots(
-                        rows=1, cols=3,
-                        subplot_titles=("Hue", "Saturation", "Value"),
-                    )
-                    hist_fig.add_trace(
-                        go.Bar(x=list(range(16)), y=h_vals, marker_color=PRIMARY), row=1, col=1
-                    )
-                    hist_fig.add_trace(
-                        go.Bar(x=list(range(16)), y=s_vals, marker_color=SECONDARY), row=1, col=2
-                    )
-                    hist_fig.add_trace(
-                        go.Bar(x=list(range(16)), y=v_vals, marker_color=PRIMARY_LIGHT), row=1, col=3
-                    )
-                    hist_fig.update_layout(height=260, showlegend=False, margin=dict(t=40, b=20))
-                    hist_fig.update_xaxes(title_text="Bin")
-                    hist_fig.update_yaxes(title_text="Proportion", row=1, col=1)
-                    st.plotly_chart(hist_fig, use_container_width=True)
+        with st.expander(f"🎨 Surface quality grading {'':s}"):
+            st.caption("🚧 Preview data — this module is not implemented yet.")
+            st.markdown(grade_badge(grade), unsafe_allow_html=True)
+            stars = {"A": "★★★★★", "B": "★★★★☆", "C": "★★★☆☆", "D": "★★☆☆☆"}[grade]
+            st.markdown(f"**{stars}**")
+            mc1, mc2 = st.columns(2)
+            mc1.metric("Surface Smoothness", round(random.uniform(0.5, 0.99), 2))
+            mc2.metric("Shape Score", round(random.uniform(0.5, 0.99), 2))
 
-                    st.markdown("**Model information**")
-                    mi1, mi2, mi3, mi4 = st.columns(4)
-                    mi1.metric("Architecture", "EfficientNetB0 + Fusion")
-                    mi2.metric("Inputs", f"224×224 + {feature_count} feats")
-                    mi3.metric("Classes", str(len(probabilities)))
-                    mi4.metric("Inference", f"{inference_time_ms:.1f} ms")
+        # ==========================================================
+        # === CLEAN BLEMISH & DAMAGE DETECTION UI (DROPDOWN STYLE) ===
+        # ==========================================================
+        # Changed to an expander to match the "dropdown list" style of other UI sections.
+        # Set to expanded=False to be closed by default as requested.
+        with st.expander("🔬 Surface Defect & Blemish Analysis", expanded=False):
+            # --- Side-by-Side Image Comparison ---
+            col_img1, col_img2 = st.columns(2)
+            with col_img1:
+                st.image(
+                    cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+                    caption="📷 Original Photo",
+                    use_container_width=True,
+                )
+            with col_img2:
+                st.image(
+                    cv2.cvtColor(blemish_result["overlay"], cv2.COLOR_BGR2RGB),
+                    caption="🔴 Defect Overlay (Red = Blemish/Damage)",
+                    use_container_width=True,
+                )
 
-                with st.expander(f"🎨 Surface quality grading {'':s}"):
-                    st.caption("🚧 Preview data — this module is not implemented yet.")
-                    st.markdown(grade_badge(grade), unsafe_allow_html=True)
-                    stars = {"A": "★★★★★", "B": "★★★★☆", "C": "★★★☆☆", "D": "★★☆☆☆"}[grade]
-                    st.markdown(f"**{stars}**")
-                    mc1, mc2 = st.columns(2)
-                    mc1.metric("Surface Smoothness", round(random.uniform(0.5, 0.99), 2))
-                    mc2.metric("Shape Score", round(random.uniform(0.5, 0.99), 2))
+            # --- Blemish Metrics (Using CSS 'metric-card') ---
+            st.markdown("##### Blemish Metrics")
+            bm1, bm2, bm3, bm4 = st.columns(4)
+            with bm1:
+                metric_card("Defect Percentage", f"{defect_pct:.2f}%")
+            with bm2:
+                metric_card("Severity", severity)
+            with bm3:
+                metric_card("Quality Grade", grade)
+            with bm4:
+                metric_card("Detected Regions", blemish_result["component_count"])
 
-                with st.expander("🔬 Blemish & damage quantification"):
-                    st.caption("🚧 Preview data — this module is not implemented yet.")
-                    st.metric("Defect Percentage", f"{defect_pct}%")
-                    st.write("Defect types identified: " + ", ".join(random.sample(DEFECT_TYPES, k=2)))
-                    sev_color = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}[severity]
-                    st.write(f"Severity: {sev_color} **{severity}**")
+            st.write(f"**Detected Defect Types:** `{', '.join(defect_types) if defect_types else 'None'}`")
 
-                processed_image = result["segmented_rgb"]
+            # --- Hidden Technical Debug Data ---
+            with st.expander("🧪 View Technical Debug Data (Binary Damage Mask & Blackhat)"):
+                cdb1, cdb2 = st.columns(2)
+                with cdb1:
+                    st.image(blemish_result["damage_mask"], clamp=True, caption="Binary Damage Mask (White = Defect)")
+                with cdb2:
+                    st.image(blemish_result["blackhat"], clamp=True, caption="Blackhat Transform (Highlights Dark Spots)")
 
 # ------------------------------------------------------------------
 # PAGE 3: ASSESSMENT DETAILS
