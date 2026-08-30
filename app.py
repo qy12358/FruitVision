@@ -750,14 +750,28 @@ elif page == "New Assessment":
                 f"Mango gate score: {best_gate_score * 100:.1f}% "
                 f"({gate_method}). Ripeness analysis was not run."
             )
+            with st.expander("Why the mango gate rejected this image"):
+                if detected_objects:
+                    for item in detected_objects:
+                        st.write(
+                            f"Object {item['object_index']}: "
+                            f"CNN={item['model_probability'] * 100:.1f}%"
+                            if item["model_probability"] is not None
+                            else f"Object {item['object_index']}: no CNN model"
+                        )
+                        st.caption(
+                            item.get("reason", "No rejection details available.")
+                        )
+                else:
+                    st.caption("No foreground candidate was found.")
             gate_col1, gate_col2 = st.columns(2)
             with gate_col1:
                 st.image(image, channels="BGR", caption="Rejected input")
             with gate_col2:
                 st.image(
-                    result["mask"],
+                    result["fruit_mask"],
                     clamp=True,
-                    caption="Foreground candidate used by mango gate",
+                    caption="Layer 2: fruit mask used by mango gate",
                 )
             st.stop()
 
@@ -954,8 +968,16 @@ elif page == "New Assessment":
                 st.image(result["resized"], channels="BGR", caption="Model input (224×224, aspect-preserved)")
             with col2:
                 st.image(
-                    result["mask"], clamp=True,
-                    caption="Segmentation mask (white = mango)",
+                    result["candidate_mask"], clamp=True,
+                    caption="Layer 0: foreground candidate",
+                )
+                st.image(
+                    result["leaf_mask"], clamp=True,
+                    caption="Layer 1: removed leaf layer",
+                )
+                st.image(
+                    result["fruit_mask"], clamp=True,
+                    caption="Layer 2: fruit mask",
                 )
                 st.image(
                     result["segmented_rgb"],

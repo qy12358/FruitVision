@@ -24,10 +24,16 @@ class MangoIdentifier:
         model_path: str = "models/mango_identifier.keras",
         input_size: tuple = (224, 224),
         acceptance_threshold: float = 0.55,
+        cnn_threshold: float = 0.40,
     ):
         self.model_path = Path(model_path)
         self.input_size = input_size
         self.acceptance_threshold = acceptance_threshold
+        # The original 0.50 cutoff rejected the green/yellow multi-mango
+        # example even though its combined evidence was strong.  The gate is
+        # calibrated with the verified examples in dataset/mango_gate_examples
+        # and uses the combined score plus explicit hard negatives.
+        self.cnn_threshold = cnn_threshold
         self.preprocessor = ImagePreprocessor(resize=input_size)
         self.model = None
 
@@ -295,7 +301,11 @@ class MangoIdentifier:
                 components.append(component)
 
         if len(components) > 1:
-            minimum_area = max(100, int(cv2.countNonZero(binary) * 0.0025))
+            # Tiny detached stems/highlights are not separate fruit objects.
+            # Keep substantial components so a real second mango survives,
+            # while a small dark/bright fragment in one rotten mango does not
+            # become a second mango prediction.
+            minimum_area = max(100, int(cv2.countNonZero(binary) * 0.01))
             filtered = [
                 component for component in components
                 if cv2.countNonZero(component) >= minimum_area
@@ -366,6 +376,42 @@ class MangoIdentifier:
         )
         analysis_image = full["original"]
         object_masks = self._split_object_masks(full["mask"])
+        scene_object_count = len(object_masks)
+        candidate_binary = np.where(
+            full["candidate_mask"] > 0,
+            255,
+            0,
+        ).astype(np.uint8)
+        _, _, candidate_stats, _ = cv2.connectedComponentsWithStats(
+            candidate_binary,
+            connectivity=8,
+        )
+        candidate_foreground_area = max(
+            1,
+            int(cv2.countNonZero(candidate_binary)),
+        )
+        candidate_component_count = sum(
+            int(area) >= 0.01 * candidate_foreground_area
+            for area in candidate_stats[1:, cv2.CC_STAT_AREA]
+        )
+        candidate_areas = sorted(
+            (int(area) for area in candidate_stats[1:, cv2.CC_STAT_AREA]),
+            reverse=True,
+        )
+        substantial_candidate_count = sum(
+            area >= 0.15 * candidate_areas[0]
+            for area in candidate_areas
+        ) if candidate_areas else 0
+        # A natural photograph whose foreground has fragmented into many
+        # components is usually foliage/background, not a clean mango scene.
+        # Two or three components are still allowed for multiple mangoes.
+        scene_clutter = (
+            scene_object_count > 3
+            or (
+                candidate_component_count > 2
+                and substantial_candidate_count < 2
+            )
+        )
         objects = []
 
         for object_index, object_mask in enumerate(object_masks, start=1):
@@ -391,26 +437,52 @@ class MangoIdentifier:
                     not evidence["round_orange"]
                     and not evidence["round_warm_fruit"]
                     and not evidence["round_red_fruit"]
-                    and not evidence["round_yellow_fruit"]
                     and not evidence["green_leaf_like"]
                     and evidence["area_ratio"] >= 0.025
                     and evidence["colour_ratio"] >= 0.35
                     and score >= self.acceptance_threshold
+                    and not scene_clutter
                 )
             else:
                 score = 0.75 * model_probability + 0.25 * evidence["classical_score"]
                 method = "binary CNN + HSV/contour evidence"
                 accepted = (
                     evidence["area_ratio"] >= 0.015
-                    and model_probability >= 0.50
+                    and model_probability >= self.cnn_threshold
                     and score >= self.acceptance_threshold
-                    # Hard negative: a round, strongly orange object is not
-                    # accepted as Harumanis even when the CNN is overconfident.
+                    # A yellow/green mango can satisfy the old round-yellow
+                    # rule, so colour alone must never reject a mango.  The
+                    # binary model is the species decision; this rule only
+                    # protects against the strongly citrus-like case.
                     and not evidence["round_orange"]
                     and not evidence["round_warm_fruit"]
                     and not evidence["round_red_fruit"]
-                    and not evidence["round_yellow_fruit"]
                     and not evidence["green_leaf_like"]
+                    and not scene_clutter
+                )
+
+            rejection_reasons = []
+            if evidence["area_ratio"] < (0.025 if model_probability is None else 0.015):
+                rejection_reasons.append("foreground area is too small")
+            if model_probability is not None and model_probability < self.cnn_threshold:
+                rejection_reasons.append(
+                    f"mango CNN probability is below {self.cnn_threshold:.0%}"
+                )
+            if score < self.acceptance_threshold:
+                rejection_reasons.append(
+                    f"combined gate score is below {self.acceptance_threshold:.2f}"
+                )
+            for flag, label in (
+                ("round_orange", "round orange/citrus-like object"),
+                ("round_warm_fruit", "round warm-colour object"),
+                ("round_red_fruit", "round red-fruit-like object"),
+                ("green_leaf_like", "leaf-like foreground shape"),
+            ):
+                if evidence[flag]:
+                    rejection_reasons.append(label)
+            if scene_clutter:
+                rejection_reasons.append(
+                    f"foreground fragmented into {scene_object_count} objects"
                 )
 
             objects.append({
@@ -426,8 +498,13 @@ class MangoIdentifier:
                 "reason": (
                     "Mango detected."
                     if accepted
-                    else "Rejected as non-mango."
+                    else "Rejected: " + "; ".join(rejection_reasons)
                 ),
+                "rejection_reasons": rejection_reasons,
+                "scene_object_count": scene_object_count,
+                "candidate_component_count": candidate_component_count,
+                "substantial_candidate_count": substantial_candidate_count,
+                "scene_clutter": scene_clutter,
                 **evidence,
             })
         return objects

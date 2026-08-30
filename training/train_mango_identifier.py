@@ -45,6 +45,11 @@ MULTI_SCENE_ROOT = (
     / "fruits360-multi"
     / "test-multiple_fruits"
 )
+EXTRA_EXAMPLE_ROOT = (
+    PROJECT_ROOT
+    / "dataset"
+    / "mango_gate_examples"
+)
 MODEL_PATH = PROJECT_ROOT / "models" / "mango_identifier.keras"
 
 SEED = 42
@@ -132,6 +137,26 @@ def collect_examples() -> list[tuple[str, int]]:
             f"{min(len(multi_negative_paths), MULTI_SCENE_NEGATIVE_LIMIT)} "
             "mango-free multi-fruit hard negatives."
         )
+
+    # Include manually verified examples supplied for this project.  These
+    # are especially important hard cases because Fruit-360 photographs have
+    # a different background/style distribution from the application inputs.
+    # The folders are deliberately explicit so a new example cannot silently
+    # change class just because its filename contains a fruit name.
+    for label, folder_name in ((1, "positive"), (0, "negative")):
+        folder = EXTRA_EXAMPLE_ROOT / folder_name
+        if not folder.exists():
+            continue
+        extra_paths = [
+            path for path in sorted(folder.rglob("*"))
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        examples.extend((str(path), label) for path in extra_paths)
+        if extra_paths:
+            print(
+                f"Added {len(extra_paths)} verified {folder_name} "
+                "mango-gate examples."
+            )
 
     if not examples:
         raise RuntimeError("No training images were found for the mango gate.")
