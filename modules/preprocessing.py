@@ -100,16 +100,45 @@ class ImagePreprocessor:
         image,
     ):
         """
-        Resize image to the target size.
+        Resize image to the target size without changing its aspect ratio.
 
-        INTER_AREA is appropriate for image downsampling.
+        Images are letterboxed with black pixels.  Directly resizing a
+        portrait mango to 224x224 makes it wider or narrower than the real
+        fruit, which corrupts contour/shape information and changes the
+        visual proportions seen by the classifier.
         """
 
-        return cv2.resize(
-            image,
-            self.resize,
-            interpolation=cv2.INTER_AREA,
+        target_w, target_h = self.resize
+        height, width = image.shape[:2]
+        if height <= 0 or width <= 0:
+            raise ValueError("Input image has an invalid size.")
+
+        scale = min(target_w / width, target_h / height)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+
+        interpolation = (
+            cv2.INTER_AREA
+            if scale < 1.0
+            else cv2.INTER_LINEAR
         )
+        resized = cv2.resize(
+            image,
+            (new_width, new_height),
+            interpolation=interpolation,
+        )
+
+        canvas = np.zeros(
+            (target_h, target_w, image.shape[2]),
+            dtype=image.dtype,
+        )
+        x_offset = (target_w - new_width) // 2
+        y_offset = (target_h - new_height) // 2
+        canvas[
+            y_offset:y_offset + new_height,
+            x_offset:x_offset + new_width,
+        ] = resized
+        return canvas
 
     # ========================================================================
     # BGR → HSV
@@ -277,6 +306,8 @@ class ImagePreprocessor:
     def segment_mango(
         self,
         hsv_image,
+        keep_all_components=False,
+        source_bgr=None,
     ):
         """
         Segment the likely mango foreground.
@@ -330,7 +361,7 @@ class ImagePreprocessor:
 
         saturation_mask = cv2.inRange(
             s,
-            30,
+            35,
             255,
         )
 
@@ -349,7 +380,7 @@ class ImagePreprocessor:
 
         value_mask = cv2.inRange(
             v,
-            30,
+            35,
             255,
         )
 
@@ -357,10 +388,124 @@ class ImagePreprocessor:
         # Combine masks
         # --------------------------------------------------------------------
 
-        mask = cv2.bitwise_and(
+        candidate = cv2.bitwise_and(
             saturation_mask,
             value_mask,
         )
+
+        # Saturation/value alone marks colourful foliage and outdoor
+        # backgrounds as foreground.  Use GrabCut at the native resolution
+        # when the source image is available, while retaining the HSV
+        # candidate as a hard boundary.
+        mask = candidate
+        # GrabCut is intentionally bounded to moderate images.  The mask is
+        # still returned at native resolution, but running five graph-cut
+        # iterations on a multi-megapixel upload is unnecessarily slow.
+        border_pixels = np.concatenate(
+            (
+                candidate[0, :], candidate[-1, :],
+                candidate[:, 0], candidate[:, -1],
+            )
+        )
+        border_candidate_ratio = float(np.mean(border_pixels > 0))
+        if (
+            source_bgr is not None
+            and source_bgr.shape[:2] == hsv_image.shape[:2]
+            and max(source_bgr.shape[:2]) <= 640
+            and border_candidate_ratio >= 0.15
+        ):
+            height, width = candidate.shape[:2]
+            grabcut_mask = np.full(
+                (height, width), cv2.GC_PR_BGD, dtype=np.uint8
+            )
+            border = max(2, int(round(min(height, width) * 0.025)))
+            grabcut_mask[:border, :] = cv2.GC_BGD
+            grabcut_mask[-border:, :] = cv2.GC_BGD
+            grabcut_mask[:, :border] = cv2.GC_BGD
+            grabcut_mask[:, -border:] = cv2.GC_BGD
+            seed_size = max(3, int(round(min(height, width) * 0.025)))
+            if seed_size % 2 == 0:
+                seed_size += 1
+            # Warm hues are useful sure-foreground seeds for yellow/orange
+            # mangoes, apples and citrus.  Saturated green seeds support
+            # green mangoes but are deliberately not taken from the whole
+            # candidate mask, otherwise an outdoor leafy background becomes
+            # a single giant foreground seed.
+            warm_seed = (
+                (((h <= 35) | (h >= 165)) & (s >= 70) & (v >= 45))
+                & (candidate > 0)
+            )
+            green_seed = (
+                ((h >= 35) & (h <= 95) & (s >= 75) & (v <= 220))
+                & (candidate > 0)
+            )
+            # Prefer warm fruit pixels because green foliage is a common
+            # false foreground.  Fall back to green only when the image has
+            # no meaningful warm fruit evidence (e.g. an unripe green mango
+            # on a plain background).
+            fruit_seed = warm_seed
+            if cv2.countNonZero(fruit_seed.astype(np.uint8)) < 0.01 * height * width:
+                fruit_seed = green_seed
+            fruit_seed = fruit_seed.astype(np.uint8) * 255
+            fruit_seed = cv2.morphologyEx(
+                fruit_seed,
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            )
+            fruit_seed = cv2.morphologyEx(
+                fruit_seed,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+            )
+            grabcut_mask[fruit_seed == 0] = cv2.GC_PR_BGD
+            grabcut_mask[candidate == 0] = cv2.GC_BGD
+            grabcut_mask[fruit_seed > 0] = cv2.GC_PR_FGD
+
+            seed_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (seed_size, seed_size)
+            )
+            sure_foreground = cv2.erode(fruit_seed, seed_kernel)
+            if cv2.countNonZero(sure_foreground) == 0:
+                sure_foreground = cv2.erode(
+                    fruit_seed,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                )
+            grabcut_mask[sure_foreground > 0] = cv2.GC_FGD
+
+            if np.any(grabcut_mask == cv2.GC_FGD):
+                background_model = np.zeros((1, 65), np.float64)
+                foreground_model = np.zeros((1, 65), np.float64)
+                try:
+                    cv2.grabCut(
+                        source_bgr,
+                        grabcut_mask,
+                        None,
+                        background_model,
+                        foreground_model,
+                        5,
+                        cv2.GC_INIT_WITH_MASK,
+                    )
+                    grabcut_foreground = np.where(
+                        (grabcut_mask == cv2.GC_FGD)
+                        | (grabcut_mask == cv2.GC_PR_FGD),
+                        255,
+                        0,
+                    ).astype(np.uint8)
+                    mask = cv2.bitwise_and(grabcut_foreground, candidate)
+                    # A graph cut that retains almost the whole frame has
+                    # failed to separate a natural background.  In that
+                    # case, use the conservative fruit-colour seed instead
+                    # of returning a scene-sized foreground mask.
+                    if (
+                        cv2.countNonZero(mask)
+                        > 0.72 * mask.shape[0] * mask.shape[1]
+                        and cv2.countNonZero(fruit_seed) > 0
+                    ):
+                        mask = fruit_seed
+                except cv2.error:
+                    # Keep the deterministic candidate for degenerate or
+                    # very small inputs where GrabCut cannot initialize.
+                    mask = candidate
 
         # ====================================================================
         # MORPHOLOGICAL PROCESSING
@@ -406,7 +551,7 @@ class ImagePreprocessor:
         mask = cv2.morphologyEx(
             mask,
             cv2.MORPH_CLOSE,
-            kernel,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
         )
 
         # ====================================================================
@@ -420,7 +565,7 @@ class ImagePreprocessor:
             )
         )
 
-        if num_labels > 1:
+        if num_labels > 1 and not keep_all_components:
 
             # --------------------------------------------------------------
             # Ignore label 0 because it represents the background.
@@ -519,6 +664,8 @@ class ImagePreprocessor:
     def preprocess(
         self,
         image,
+        keep_all_components=False,
+        mask_override=None,
     ):
         """
         Execute the complete Module 1 preprocessing pipeline.
@@ -548,12 +695,20 @@ class ImagePreprocessor:
             Module 2
         """
 
+        if image is None or image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError("Input image must be a BGR image with 3 channels.")
+
+        # Segment at native resolution.  The model-sized representation is
+        # produced after masking, so the contour and the visible result do
+        # not depend on a 224x224 thumbnail.
+        original = np.ascontiguousarray(image.copy())
+
         # ====================================================================
-        # STEP 1 — RESIZE
+        # STEP 1 — MODEL RESIZE (segmentation stays native)
         # ====================================================================
 
         resized = self.resize_image(
-            image
+            original
         )
 
         # ====================================================================
@@ -561,7 +716,7 @@ class ImagePreprocessor:
         # ====================================================================
 
         hsv = self.bgr_to_hsv(
-            resized
+            original
         )
 
         # ====================================================================
@@ -576,8 +731,14 @@ class ImagePreprocessor:
         # STEP 4 — GAUSSIAN FILTER
         # ====================================================================
 
-        gaussian = self.gaussian_filter(
-            hsv
+        # Smooth the BGR image before converting to HSV.  Blurring the H
+        # channel directly is not ideal because hue is circular (0 and 179
+        # are neighbours), while BGR smoothing is well-defined.
+        gaussian_bgr = self.gaussian_filter(
+            original
+        )
+        gaussian = self.bgr_to_hsv(
+            gaussian_bgr
         )
 
         # ====================================================================
@@ -592,19 +753,44 @@ class ImagePreprocessor:
         # STEP 6 — MANGO SEGMENTATION
         # ====================================================================
 
-        segmented, mask = (
-            self.segment_mango(
-                enhanced
+        if mask_override is None:
+            segmented_for_mask, mask = self.segment_mango(
+                enhanced,
+                keep_all_components=keep_all_components,
+                source_bgr=original,
             )
+        else:
+            if mask_override.shape[:2] != original.shape[:2]:
+                raise ValueError("mask_override must match the input image size.")
+            mask = np.where(mask_override > 0, 255, 0).astype(np.uint8)
+
+        # Keep the original colour values for the classifier.  The enhanced
+        # HSV image is only used to make the foreground mask.  Applying CLAHE
+        # to the ripeness input would change the colour evidence the model is
+        # supposed to learn from.
+        segmented_hsv = cv2.bitwise_and(
+            hsv,
+            hsv,
+            mask=mask,
+        )
+        segmented_bgr = cv2.bitwise_and(
+            original,
+            original,
+            mask=mask,
+        )
+        segmented_rgb = cv2.cvtColor(
+            segmented_bgr,
+            cv2.COLOR_BGR2RGB,
         )
 
-        # ====================================================================
-        # STEP 7 — CONVERT SEGMENTED IMAGE
-        # ====================================================================
-
-        segmented_rgb = cv2.cvtColor(
-            segmented,
-            cv2.COLOR_HSV2RGB,
+        model_segmented_bgr = self.resize_image(segmented_bgr)
+        model_segmented_hsv = cv2.cvtColor(
+            model_segmented_bgr,
+            cv2.COLOR_BGR2HSV,
+        )
+        model_segmented_rgb = cv2.cvtColor(
+            model_segmented_bgr,
+            cv2.COLOR_BGR2RGB,
         )
 
         # ====================================================================
@@ -613,7 +799,7 @@ class ImagePreprocessor:
 
         mango_pixels = (
             self.get_mango_pixels(
-                enhanced,
+                hsv,
                 mask,
             )
         )
@@ -628,6 +814,10 @@ class ImagePreprocessor:
             # Basic preprocessing
             # =================================================================
 
+            "original": original,
+
+            # Neural-network-sized raw image.  The native-resolution fields
+            # below are the authoritative segmentation outputs.
             "resized": resized,
 
             "hsv": hsv,
@@ -638,7 +828,8 @@ class ImagePreprocessor:
 
             "value": v,
 
-            "gaussian": gaussian,
+            "gaussian": gaussian_bgr,
+            "gaussian_hsv": gaussian,
 
             # =================================================================
             # Contrast enhancement
@@ -656,9 +847,17 @@ class ImagePreprocessor:
             # Segmentation
             # =================================================================
 
-            "segmented": segmented,
+            "segmented": segmented_hsv,
+
+            "segmented_bgr": segmented_bgr,
 
             "segmented_rgb": segmented_rgb,
+
+            "model_segmented_hsv": model_segmented_hsv,
+
+            "model_segmented_bgr": model_segmented_bgr,
+
+            "model_segmented_rgb": model_segmented_rgb,
 
             "mask": mask,
 
@@ -668,7 +867,7 @@ class ImagePreprocessor:
             # Metadata
             # =================================================================
 
-            "original_size": image.shape,
+            "original_size": original.shape,
 
             "resized_size": resized.shape,
 

@@ -793,7 +793,7 @@ class HybridRipenessClassifier:
 
     def __init__(
         self,
-        model_path: str = "models/efficientnet_fruit.keras",
+        model_path: str = "models/mango_ripeness.keras",
         class_indices_path: str = "models/class_indices.json",
         input_size: tuple = (224, 224),
     ):
@@ -893,18 +893,32 @@ class HybridRipenessClassifier:
         Keras EfficientNetB0 performs its own input rescaling.
         """
 
-        rgb = cv2.cvtColor(
+        height, width = segmented_hsv.shape[:2]
+        target_width, target_height = self.input_size
+        scale = min(target_width / width, target_height / height)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(
             segmented_hsv,
-            cv2.COLOR_HSV2RGB,
+            (new_width, new_height),
+            interpolation=interpolation,
         )
-
-        if rgb.shape[:2] != self.input_size:
-
-            rgb = cv2.resize(
-                rgb,
-                self.input_size,
-                interpolation=cv2.INTER_AREA,
-            )
+        canvas = np.zeros(
+            (target_height, target_width, 3),
+            dtype=resized.dtype,
+        )
+        x_offset = (target_width - new_width) // 2
+        y_offset = (target_height - new_height) // 2
+        canvas[
+            y_offset:y_offset + new_height,
+            x_offset:x_offset + new_width,
+        ] = resized
+        # This is the representation used by the existing trained model:
+        # HSV channels converted to an RGB-shaped tensor.  Keep it stable so
+        # a source-level preprocessing refactor does not silently invalidate
+        # the saved ripeness weights.
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_HSV2RGB)
 
         normalized = rgb.astype(
             np.float32
