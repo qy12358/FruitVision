@@ -1,7 +1,7 @@
 """
 FruitVision AI — Fruit Ripeness & Surface Quality Assessment System
 Run with:  streamlit run app.py
-Requires:  pip install streamlit pandas numpy plotly pillow opencv-python tensorflow scikit-learn seaborn matplotlib
+Requires:  pip install streamlit pandas numpy plotly pillow opencv-python tensorflow scikit-learn seaborn matplotlib reportlab
 """
 
 import streamlit as st
@@ -20,8 +20,15 @@ from modules.preprocessing import ImagePreprocessor
 from modules.mango_identifier import MangoIdentifier
 from modules.ripeness_classifier import HybridRipenessClassifier
 from modules.blemish_detector import BlemishDetector
+from modules.quality_grader import QualityGrader
+from modules.report_generator import (
+    format_coverage,
+    generate_pdf_report,
+    generate_report_string,
+)
 
 preprocessor = ImagePreprocessor()
+quality_grader = QualityGrader()
 
 
 def model_signature(path: str) -> int:
@@ -152,6 +159,11 @@ st.markdown(
     .badge-B {{ background-color: #8BC34A; }}
     .badge-C {{ background-color: {YELLOW}; color:#1A1A2E; }}
     .badge-D {{ background-color: {RED}; }}
+    .badge-premium {{ background-color: {GREEN}; }}
+    .badge-grade-1 {{ background-color: #8BC34A; }}
+    .badge-grade-2 {{ background-color: {YELLOW}; color:#1A1A2E; }}
+    .badge-reject {{ background-color: {RED}; }}
+    .badge-unavailable {{ background-color: #757575; }}
 
     .chip {{
         display: inline-block;
@@ -372,7 +384,18 @@ def badge_html(text, css_class):
 
 
 def grade_badge(grade):
-    return badge_html(grade, f"badge-{grade}")
+    css_class = {
+        "Premium": "badge-premium",
+        "Grade 1": "badge-grade-1",
+        "Grade 2": "badge-grade-2",
+        "Reject": "badge-reject",
+        "Unavailable": "badge-unavailable",
+        "A": "badge-A",
+        "B": "badge-B",
+        "C": "badge-C",
+        "D": "badge-D",
+    }.get(grade, "badge-unavailable")
+    return badge_html(grade or "Unavailable", css_class)
 
 
 def ripeness_badge(level):
@@ -497,16 +520,27 @@ def combine_object_blemish_results(image, objects, analyses):
         )
 
     mango_area = int(cv2.countNonZero(safe_mask))
-    damage_area = int(cv2.countNonZero(damage_mask))
-    defect_percentage = damage_area / mango_area * 100.0 if mango_area else 0.0
+    blemish_mask = np.zeros((height, width), dtype=np.uint8)
+    for key in ("dark_spots", "brown_lesions", "white_surface"):
+        blemish_mask = np.maximum(blemish_mask, component_masks[key])
+    damage_only_mask = np.zeros((height, width), dtype=np.uint8)
+    for key in ("severe_dark", "wet_damage", "scratch_mask"):
+        damage_only_mask = np.maximum(damage_only_mask, component_masks[key])
+
+    blemish_area = int(cv2.countNonZero(blemish_mask))
+    damage_area = int(cv2.countNonZero(damage_only_mask))
+    defect_area = int(cv2.countNonZero(damage_mask))
+    defect_percentage = defect_area / mango_area * 100.0 if mango_area else 0.0
+    blemish_percentage = blemish_area / mango_area * 100.0 if mango_area else 0.0
+    damage_percentage = damage_area / mango_area * 100.0 if mango_area else 0.0
     if defect_percentage < 1.5:
-        severity, grade = "Low", "A"
+        severity = "Low"
     elif defect_percentage < 3.0:
-        severity, grade = "Medium", "B"
+        severity = "Medium"
     elif defect_percentage < 5.0:
-        severity, grade = "Medium", "C"
+        severity = "Medium"
     else:
-        severity, grade = "High", "D"
+        severity = "High"
 
     overlay = image.copy()
     overlay[damage_mask > 0] = (0, 0, 255)
@@ -518,45 +552,27 @@ def combine_object_blemish_results(image, objects, analyses):
 
     return {
         "defect_percentage": round(float(defect_percentage), 2),
-        "damage_percentage": round(float(defect_percentage), 2),
-        "blemish_pixel_area": damage_area,
+        "damage_percentage": round(float(damage_percentage), 2),
+        "blemish_percentage": round(float(blemish_percentage), 2),
+        "blemish_pixel_area": blemish_area,
+        "damage_pixel_area": damage_area,
+        "defect_pixel_area": defect_area,
         "mango_pixel_area": mango_area,
         "severity": severity,
-        "grade": grade,
+        "grade": "Unavailable",
         "defect_types": list(dict.fromkeys(defect_types)) or ["None"],
         "component_count": component_count,
         "components": [component for analysis in analyses for component in analysis["components"]],
         "damage_mask": damage_mask,
+        "defect_mask": damage_mask,
+        "blemish_mask": blemish_mask,
+        "damage_only_mask": damage_only_mask,
         "overlay": overlay,
         "safe_mango_mask": safe_mask,
         "blackhat": blackhat,
         "candidate_mask": candidate_mask,
         **component_masks,
     }
-
-
-# Generate Report Helper Function
-def generate_report_string(fruit_type, batch_id, ripeness, confidence, grade, defect_pct, severity, defect_types):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    report = f"""# FruitVision AI - Inspection Report
-
-**Assessment ID:** FR-{datetime.now().strftime('%Y%m%d%H%M%S')}
-**Date & Time:** {timestamp}
-**Batch ID:** {batch_id}
-**Fruit Type:** {fruit_type}
-
-## Analysis Results
-* **Predicted Ripeness:** {ripeness if ripeness else "N/A"}
-* **Confidence Level:** {confidence:.1f}%
-* **Surface Quality Grade:** {grade}
-* **Defect Percentage:** {defect_pct:.2f}%
-* **Severity:** {severity}
-* **Defect Types Detected:** {', '.join(defect_types) if defect_types else 'None'}
-
----
-*This report was generated automatically by FruitVision AI.*
-"""
-    return report
 
 
 # ------------------------------------------------------------------
@@ -799,8 +815,15 @@ elif page == "New Assessment":
             )
 
         defect_pct = blemish_result["defect_percentage"]
+        blemish_pct = blemish_result["blemish_percentage"]
+        damage_pct = blemish_result["damage_percentage"]
         severity = blemish_result["severity"]
-        grade = blemish_result["grade"]
+        quality_result = quality_grader.grade(
+            blemish_coverage=None,
+            damage_coverage=None,
+            ripeness=None,
+        )
+        grade = quality_result["grade"]
         defect_types = blemish_result["defect_types"]
 
         mango_pixel_count = int(cv2.countNonZero(result["mask"]))
@@ -852,6 +875,13 @@ elif page == "New Assessment":
 
             ripeness = prediction
             raw_ripeness = raw_prediction
+
+        quality_result = quality_grader.grade(
+            blemish_coverage=blemish_pct,
+            damage_coverage=damage_pct,
+            ripeness=ripeness,
+        )
+        grade = quality_result["grade"]
 
         if classification_error:
             st.error(classification_error)
@@ -923,8 +953,13 @@ elif page == "New Assessment":
         b1, b2, b3 = st.columns(3)
         with b1:
             report_text = generate_report_string(
-                fruit_type, batch_id, ripeness, confidence, grade,
-                defect_pct, severity, defect_types
+                fruit_type=fruit_type,
+                batch_id=batch_id,
+                ripeness=ripeness,
+                confidence=confidence,
+                quality_result=quality_result,
+                severity=severity,
+                defect_types=defect_types,
             )
             st.download_button(
                 label="📄 Generate Report",
@@ -934,7 +969,31 @@ elif page == "New Assessment":
                 use_container_width=True
             )
         with b2:
-            if st.button("💾 Save to History", use_container_width=True):
+            try:
+                pdf_report = generate_pdf_report(
+                    fruit_type=fruit_type,
+                    batch_id=batch_id,
+                    ripeness=ripeness,
+                    confidence=confidence,
+                    quality_result=quality_result,
+                    severity=severity,
+                    defect_types=defect_types,
+                    original_image=image,
+                    overlay_image=blemish_result["overlay"],
+                )
+            except RuntimeError as exc:
+                pdf_report = None
+                st.warning(str(exc))
+            st.download_button(
+                label="Export PDF",
+                data=pdf_report or b"",
+                file_name=f"FR-{datetime.now().strftime('%Y%m%d%H%M%S')}_report.pdf",
+                mime="application/pdf",
+                disabled=pdf_report is None,
+                use_container_width=True,
+            )
+        with b3:
+            if st.button("Save to History", use_container_width=True):
                 new_id = f"FR-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                 st.session_state.saved_assessments.append(
                     {
@@ -947,8 +1006,6 @@ elif page == "New Assessment":
                     }
                 )
                 st.success(f"Saved as {new_id} — view it in History / Reports.")
-        with b3:
-            st.selectbox("Export as", ["PDF", "CSV", "JSON"], label_visibility="collapsed")
 
         # ---- TECHNICAL DETAILS (collapsed by default) --------
         st.write("")
@@ -1067,14 +1124,27 @@ elif page == "New Assessment":
             mi3.metric("Classes", str(len(probabilities)))
             mi4.metric("Inference", f"{inference_time_ms:.1f} ms")
 
-        with st.expander(f"🎨 Surface quality grading {'':s}"):
-            st.caption("🚧 Preview data — this module is not implemented yet.")
+        with st.expander("Surface quality grading"):
+            st.caption(
+                "Final grade from blemish coverage, damage coverage, and "
+                "ripeness. No additional detection is performed here."
+            )
             st.markdown(grade_badge(grade), unsafe_allow_html=True)
-            stars = {"A": "★★★★★", "B": "★★★★☆", "C": "★★★☆☆", "D": "★★☆☆☆"}[grade]
-            st.markdown(f"**{stars}**")
-            mc1, mc2 = st.columns(2)
-            mc1.metric("Surface Smoothness", round(random.uniform(0.5, 0.99), 2))
-            mc2.metric("Shape Score", round(random.uniform(0.5, 0.99), 2))
+            st.markdown(f"**Ripeness:** {ripeness or 'Unavailable'}")
+            gc1, gc2, gc3 = st.columns(3)
+            gc1.metric(
+                "Blemish coverage",
+                format_coverage(quality_result.get("blemish_coverage")),
+            )
+            gc2.metric(
+                "Damage coverage",
+                format_coverage(quality_result.get("damage_coverage")),
+            )
+            gc3.metric(
+                "Grading status",
+                "Ready" if quality_result.get("available") else "Unavailable",
+            )
+            st.caption(quality_result.get("reason", "Grading unavailable."))
 
         # ==========================================================
         # === CLEAN BLEMISH & DAMAGE DETECTION UI (DROPDOWN STYLE) ===
@@ -1101,13 +1171,13 @@ elif page == "New Assessment":
             st.markdown("##### Blemish Metrics")
             bm1, bm2, bm3, bm4 = st.columns(4)
             with bm1:
-                metric_card("Defect Percentage", f"{defect_pct:.2f}%")
+                metric_card("Total Defect", f"{defect_pct:.2f}%")
             with bm2:
-                metric_card("Severity", severity)
+                metric_card("Blemish Coverage", f"{blemish_pct:.2f}%")
             with bm3:
-                metric_card("Quality Grade", grade)
+                metric_card("Damage Coverage", f"{damage_pct:.2f}%")
             with bm4:
-                metric_card("Detected Regions", blemish_result["component_count"])
+                metric_card("Surface Grade", grade)
 
             st.write(f"**Detected Defect Types:** `{', '.join(defect_types) if defect_types else 'None'}`")
 
