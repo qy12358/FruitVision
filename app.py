@@ -264,6 +264,36 @@ st.markdown(
     }}
     .empty-state-icon {{ font-size: 40px; margin-bottom: 10px; }}
 
+    .st-key-ripeness_distribution_card {{
+        background: white;
+        border-radius: 16px;
+        padding: 12px 16px 6px 16px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+        border: 1px solid #eee;
+    }}
+
+    .ripeness-summary {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px 10px;
+        margin-top: 4px;
+        margin-bottom: 2px;
+        font-size: 11px;
+        color: #616161;
+    }}
+
+    .ripeness-item {{
+        white-space: nowrap;
+    }}
+
+    .ripeness-dot {{
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 5px;
+    }}
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -582,35 +612,146 @@ if page == "Dashboard":
     st.markdown("<div class='section-title'>Dashboard Overview</div>", unsafe_allow_html=True)
     st.caption("A quick look at everything analyzed so far.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
+
     with c1:
-        metric_card("Total Fruits Analyzed", f"{len(history_df):,}")
-        st.caption("⬆ 8.2% vs last week")
-    with c2:
-        st.markdown("<div class='metric-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='metric-title'>Ripeness Distribution</div>", unsafe_allow_html=True)
-        # Calculate and display exact percentages inside the card
-        dist = history_df["Ripeness"].value_counts()
-        total = len(history_df)
-        pct_str = "  |  ".join([f"{k}: {v/total*100:.1f}%" for k, v in dist.items()])
-        st.caption(pct_str)
-        pie_df = dist.reset_index()
-        pie_df.columns = ["Ripeness", "Count"]
-        fig = px.pie(
-            pie_df, names="Ripeness", values="Count", hole=0.55,
-            color="Ripeness", color_discrete_map=RIPENESS_COLORS,
+        metric_card(
+            "Total Fruits Analyzed",
+            f"{len(history_df):,}"
         )
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), height=140, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c3:
-        grade_a_pct = round((history_df["Grade"] == "A").mean() * 100, 1)
-        metric_card("Quality Grade A %", f"{grade_a_pct}%")
+        st.caption("⬆ 8.2% vs last week")
+
+
+    with c2:
+        grade_a_pct = round(
+            (history_df["Grade"] == "A").mean() * 100,
+            1
+        )
+
+        metric_card(
+            "Quality Grade A %",
+            f"{grade_a_pct}%"
+        )
+
         st.progress(grade_a_pct / 100)
-    with c4:
-        defect_rate = round((history_df["Defect %"] > 5).mean() * 100, 1)
-        metric_card("Defect Detection Rate", f"{defect_rate}%")
+
+
+    with c3:
+        defect_rate = round(
+            (history_df["Defect %"] > 5).mean() * 100,
+            1
+        )
+
+        metric_card(
+            "Defect Detection Rate",
+            f"{defect_rate}%"
+        )
+
         st.caption("⬇ 1.4% vs last week")
+
+
+    # ==========================================================
+    # SECOND ROW — FULL WIDTH RIPENESS DISTRIBUTION
+    # ==========================================================
+
+    st.write("")
+    st.markdown(
+        "<div class='section-title'>Ripeness Distribution</div>",
+        unsafe_allow_html=True
+    )
+
+    dist = history_df["Ripeness"].value_counts()
+    total = len(history_df)
+
+    # ----------------------------------------------------------
+    # Four ripeness percentages
+    # ----------------------------------------------------------
+
+    r1, r2, r3, r4 = st.columns(4)
+
+    ripeness_summary = [
+        ("Unripe", r1),
+        ("Semi-Ripe", r2),
+        ("Ripe", r3),
+        ("Rotten", r4),
+    ]
+
+    for label, column in ripeness_summary:
+
+        count = int(dist.get(label, 0))
+        percentage = (count / total * 100) if total else 0
+
+        with column:
+            st.markdown(
+                f"""
+                <div style="
+                    text-align:center;
+                    padding:8px 0 4px 0;
+                ">
+                    {ripeness_badge(label)}
+                    <div style="
+                        font-size:26px;
+                        font-weight:700;
+                        margin-top:8px;
+                    ">
+                        {percentage:.1f}%
+                    </div>
+                    <div style="
+                        color:#888;
+                        font-size:12px;
+                    ">
+                        {count} fruit(s)
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+    # ----------------------------------------------------------
+    # Large donut chart
+    # ----------------------------------------------------------
+
+    pie_df = dist.reset_index()
+    pie_df.columns = ["Ripeness", "Count"]
+
+    fig = px.pie(
+        pie_df,
+        names="Ripeness",
+        values="Count",
+        hole=0.55,
+        color="Ripeness",
+        color_discrete_map=RIPENESS_COLORS,
+    )
+
+    fig.update_traces(
+        textposition="inside",
+        textinfo="percent+label",
+        textfont_size=14,
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "Count: %{value}<br>"
+            "%{percent}"
+            "<extra></extra>"
+        ),
+    )
+
+    fig.update_layout(
+        height=420,
+        margin=dict(
+            l=20,
+            r=20,
+            t=20,
+            b=20,
+        ),
+        showlegend=False,
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
 
     st.write("")
     left, right = st.columns([6, 4])
