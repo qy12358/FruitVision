@@ -20,7 +20,6 @@ from ui.components import grade_badge
 from ui.components import metric_card
 from ui.components import ripeness_badge
 from ui.education import render_hsv_histogram_tips
-from ui.education import render_model_selection_tip
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -301,15 +300,6 @@ def render_live_assessment(analysis: dict, batch_id: str):
                 st.plotly_chart(histogram_fig, use_container_width=True)
                 with st.expander("Understand the HSV colour chart", expanded=True):
                     render_hsv_histogram_tips(ripeness, h_vals, s_vals, v_vals)
-
-            st.markdown("**Model details**")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Architecture", "EfficientNetB0 + Fusion")
-            m2.metric("Inputs", f"224 x 224 + {analysis.get('feature_count', 0)} features")
-            m3.metric("Classes", str(len(probabilities)))
-            m4.metric("Inference", f"{analysis.get('inference_time_ms', 0.0):.1f} ms")
-            with st.expander("Why this AI model is used"):
-                render_model_selection_tip()
 
     with st.expander("Surface defect and blemish analysis"):
         st.caption(
