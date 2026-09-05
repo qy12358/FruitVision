@@ -41,24 +41,15 @@ Architecture:
 
 Dataset layout:
 
-dataset/
-    Training/
+dataset/mango_harumanis/harumanis_phases_V2/images/
         ripe/
         rotten/
         semi_ripe/
         unripe/
 
-    Validation/
-        ripe/
-        rotten/
-        semi_ripe/
-        unripe/
-
-    Test/
-        ripe/
-        rotten/
-        semi_ripe/
-        unripe/
+The original images are split deterministically into train/validation/test.
+The separate augmented folder is not used for evaluation because it contains
+near-duplicates of the originals and would leak information across splits.
 
 
 Important:
@@ -82,7 +73,9 @@ Important:
 # ============================================================================
 
 import json
+import hashlib
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -115,7 +108,7 @@ from tensorflow.keras.applications import (
     EfficientNetB0,
 )
 
-from tensorflow.keras.preprocessing.image import (
+from tensorflow.keras.preprocessing.image import ( 
     ImageDataGenerator,
 )
 
@@ -151,22 +144,12 @@ tf.random.set_seed(
 # PROJECT PATHS
 # ============================================================================
 
-TRAIN_DIR = (
+DATASET_DIR = (
     PROJECT_ROOT
     / "dataset"
-    / "Training"
-)
-
-VAL_DIR = (
-    PROJECT_ROOT
-    / "dataset"
-    / "Validation"
-)
-
-TEST_DIR = (
-    PROJECT_ROOT
-    / "dataset"
-    / "Test"
+    / "mango_harumanis"
+    / "harumanis_phases_V2"
+    / "images"
 )
 
 MODEL_DIR = (
@@ -176,7 +159,7 @@ MODEL_DIR = (
 
 MODEL_OUTPUT_PATH = (
     MODEL_DIR
-    / "efficientnet_fruit.keras"
+    / "mango_ripeness.keras"
 )
 
 CLASS_INDICES_PATH = (
@@ -214,8 +197,11 @@ PHASE1_EPOCHS = 15
 PHASE2_EPOCHS = 15
 
 
-# Number of EfficientNet layers to unfreeze.
-FINE_TUNE_LAYERS = 30
+# Number of EfficientNet layers to unfreeze.  The clean, non-conflicting
+# dataset is small, so updating a large part of the ImageNet backbone makes
+# the model memorize camera/background cues.  A short final fine-tune is
+# enough to adapt fruit texture while keeping generic visual features.
+FINE_TUNE_LAYERS = 10
 
 
 PHASE1_LR = 1e-3
@@ -883,6 +869,124 @@ def build_file_label_list(
     )
 
 
+def build_stratified_splits(
+    dataset_dir: str | Path,
+    class_names: list,
+    validation_fraction: float = 0.15,
+    test_fraction: float = 0.15,
+    include_augmented_train: bool = False,
+):
+    """Create deterministic per-class train/validation/test splits.
+
+    Splitting within each class keeps every maturity class represented while
+    ensuring the held-out sets contain original images only.  The same helper
+    is imported by ``evaluate_model.py`` so evaluation uses exactly the split
+    used during training.
+    """
+    dataset_dir = Path(dataset_dir)
+    rng = random.Random(SEED)
+    split_files = {"train": [], "validation": [], "test": []}
+    split_labels = {"train": [], "validation": [], "test": []}
+
+    # Deduplicate before splitting.  The prepared dataset contains exact
+    # copies under different maturity labels; retaining those would make the
+    # model receive contradictory targets and can leak a duplicate into the
+    # held-out set.  Files with conflicting labels are excluded rather than
+    # guessing which label is correct.
+    by_hash = {}
+    for class_index, class_name in enumerate(class_names):
+        class_dir = dataset_dir / class_name
+        for path in sorted(class_dir.rglob("*")):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                by_hash.setdefault(digest, []).append((str(path), class_index))
+
+    conflict_count = 0
+    class_files_by_index = {index: [] for index in range(len(class_names))}
+    for items in by_hash.values():
+        labels = {label for _, label in items}
+        if len(labels) != 1:
+            conflict_count += 1
+            continue
+        class_index = next(iter(labels))
+        class_files_by_index[class_index].append(items[0][0])
+
+    if conflict_count:
+        print(
+            "WARNING: excluded "
+            f"{conflict_count} exact-duplicate hash groups with conflicting labels."
+        )
+
+    train_source_stems = set()
+    train_source_labels = {}
+    for class_index, class_name in enumerate(class_names):
+        class_files = class_files_by_index[class_index]
+        rng.shuffle(class_files)
+        total = len(class_files)
+        test_count = max(1, int(round(total * test_fraction)))
+        validation_count = max(1, int(round(total * validation_fraction)))
+        if test_count + validation_count >= total:
+            validation_count = 1
+            test_count = 1
+
+        test_files = class_files[:test_count]
+        validation_files = class_files[test_count:test_count + validation_count]
+        train_files = class_files[test_count + validation_count:]
+
+        for split_name, files in (
+            ("train", train_files),
+            ("validation", validation_files),
+            ("test", test_files),
+        ):
+            split_files[split_name].extend(files)
+            split_labels[split_name].extend([class_index] * len(files))
+        for path in train_files:
+            stem = Path(path).stem.lower()
+            train_source_stems.add(stem)
+            train_source_labels[stem] = class_index
+
+    if include_augmented_train:
+        augmented_dir = (
+            dataset_dir.parent.parent
+            / "harumanis_phases_V2 augmented"
+        )
+        class_to_index = {
+            name.lower(): index
+            for index, name in enumerate(class_names)
+        }
+        augmented_added = 0
+        if augmented_dir.exists():
+            for path in sorted(augmented_dir.rglob("*")):
+                if not (
+                    path.is_file()
+                    and path.suffix.lower() in IMAGE_EXTENSIONS
+                ):
+                    continue
+                match = re.match(
+                    r"^(img-\d+)",
+                    path.stem.lower(),
+                )
+                label_index = class_to_index.get(path.parent.name.lower())
+                if (
+                    match
+                    and match.group(1) in train_source_stems
+                    and label_index is not None
+                    and label_index == train_source_labels[match.group(1)]
+                ):
+                    split_files["train"].append(str(path))
+                    split_labels["train"].append(label_index)
+                    augmented_added += 1
+            print(
+                f"Added {augmented_added} augmented images to training only."
+            )
+
+    return (
+        split_files["train"], split_labels["train"],
+        split_files["validation"], split_labels["validation"],
+        split_files["test"], split_labels["test"],
+    )
+
+
 # ============================================================================
 # HYBRID DATA SEQUENCE
 # ============================================================================
@@ -1104,15 +1208,9 @@ class HybridSequence(Sequence):
                     f"{image_path}"
                 )
 
-            # ----------------------------------------------------------------
-            # Resize before augmentation
-            # ----------------------------------------------------------------
-
-            image_bgr = cv2.resize(
-                image_bgr,
-                self.img_size,
-                interpolation=cv2.INTER_AREA,
-            )
+            # Resize with letterboxing before augmentation so augmentation
+            # does not create an artificial stretched mango.
+            image_bgr = self.preprocessor.resize_image(image_bgr)
 
             # ----------------------------------------------------------------
             # Data augmentation
@@ -1181,11 +1279,14 @@ class HybridSequence(Sequence):
             # EfficientNet image branch
             # ----------------------------------------------------------------
 
-            image_rgb = (
-                cv2.cvtColor(
-                    segmented_hsv,
-                    cv2.COLOR_HSV2RGB,
-                )
+            # The preprocessor segments at native resolution.  Use its
+            # aspect-preserving model-sized HSV representation for
+            # EfficientNet while retaining the native mask for the feature
+            # branch.  This preserves the representation used by the saved
+            # ripeness model.
+            image_rgb = cv2.cvtColor(
+                preprocessed["model_segmented_hsv"],
+                cv2.COLOR_HSV2RGB,
             )
 
             image_batch[
@@ -1304,7 +1405,7 @@ def build_model(
     # ------------------------------------------------------------------------
 
     feature_features = layers.Dense(
-        64,
+        32,
         activation="relu",
         name="feature_dense_1",
     )(
@@ -1330,7 +1431,7 @@ def build_model(
     # ------------------------------------------------------------------------
 
     feature_features = layers.Dense(
-        32,
+        16,
         activation="relu",
         name="feature_dense_2",
     )(
@@ -1357,7 +1458,7 @@ def build_model(
     # ========================================================================
 
     x = layers.Dense(
-        128,
+        64,
         activation="relu",
         name="fusion_dense_1",
     )(
@@ -1371,7 +1472,7 @@ def build_model(
     )
 
     x = layers.Dense(
-        64,
+        32,
         activation="relu",
         name="fusion_dense_2",
     )(
@@ -1868,39 +1969,20 @@ def train():
         "\nDataset paths:"
     )
 
-    print(
-        f"Training:   {TRAIN_DIR}"
-    )
+    print(f"Original labelled images: {DATASET_DIR}")
 
-    print(
-        f"Validation: {VAL_DIR}"
-    )
-
-    print(
-        f"Test:       {TEST_DIR}"
-    )
-
-    if not TRAIN_DIR.exists():
+    if not DATASET_DIR.exists():
 
         raise FileNotFoundError(
-            f"\nTraining directory not found:\n"
-            f"{TRAIN_DIR}"
-        )
-
-    if not VAL_DIR.exists():
-
-        raise FileNotFoundError(
-            f"\nValidation directory not found:\n"
-            f"{VAL_DIR}"
+            f"\nMango image directory not found:\n"
+            f"{DATASET_DIR}"
         )
 
     # ------------------------------------------------------------------------
     # Discover classes
     # ------------------------------------------------------------------------
 
-    class_names = discover_classes(
-        TRAIN_DIR
-    )
+    class_names = discover_classes(DATASET_DIR)
 
     print(
         "\n===== CLASS ORDER ====="
@@ -1951,21 +2033,17 @@ def train():
     )
 
     # ------------------------------------------------------------------------
-    # Build file lists
+    # Build leakage-safe file lists
     # ------------------------------------------------------------------------
 
-    train_files, train_labels = (
-        build_file_label_list(
-            TRAIN_DIR,
-            class_names,
-        )
-    )
-
-    val_files, val_labels = (
-        build_file_label_list(
-            VAL_DIR,
-            class_names,
-        )
+    (
+        train_files, train_labels,
+        val_files, val_labels,
+        test_files, test_labels,
+    ) = build_stratified_splits(
+        DATASET_DIR,
+        class_names,
+        include_augmented_train=True,
     )
 
     if not train_files:
@@ -1979,6 +2057,9 @@ def train():
         raise RuntimeError(
             "No validation images were found."
         )
+
+    if not test_files:
+        raise RuntimeError("No test images were found.")
 
     # ------------------------------------------------------------------------
     # Class weights
@@ -2043,6 +2124,14 @@ def train():
             f"{class_name}: "
             f"{val_counts[index]}"
         )
+
+    test_counts = np.bincount(
+        np.asarray(test_labels),
+        minlength=len(class_names),
+    )
+    print("\n===== TEST DISTRIBUTION (HELD OUT) =====")
+    for index, class_name in enumerate(class_names):
+        print(f"{class_name}: {test_counts[index]}")
 
     # ------------------------------------------------------------------------
     # Build training sequence
@@ -2115,8 +2204,8 @@ def train():
             filepath=str(
                 MODEL_OUTPUT_PATH
             ),
-            monitor="val_accuracy",
-            mode="max",
+            monitor="val_loss",
+            mode="min",
             save_best_only=True,
             verbose=1,
         ),

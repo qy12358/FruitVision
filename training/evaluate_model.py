@@ -50,6 +50,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # IMPORTS
 # ============================================================================
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -67,7 +71,7 @@ from sklearn.metrics import (
 
 from training.train_model import (
     HybridSequence,
-    build_file_label_list,
+    build_stratified_splits,
 )
 
 
@@ -79,16 +83,18 @@ IMG_SIZE = (224, 224)
 
 BATCH_SIZE = 32
 
-TEST_DIR = (
+DATASET_DIR = (
     PROJECT_ROOT
     / "dataset"
-    / "Test"
+    / "mango_harumanis"
+    / "harumanis_phases_V2"
+    / "images"
 )
 
 MODEL_PATH = (
     PROJECT_ROOT
     / "models"
-    / "efficientnet_fruit.keras"
+    / "mango_ripeness.keras"
 )
 
 CLASS_INDICES_PATH = (
@@ -211,32 +217,31 @@ def evaluate():
         )
 
     # ------------------------------------------------------------------------
-    # Validate Test directory
+    # Validate original labelled image directory
     # ------------------------------------------------------------------------
 
-    if not TEST_DIR.exists():
+    if not DATASET_DIR.exists():
 
         raise FileNotFoundError(
-            f"Test directory not found:\n"
-            f"{TEST_DIR}"
+            f"Mango dataset directory not found:\n"
+            f"{DATASET_DIR}"
         )
 
     # ------------------------------------------------------------------------
-    # Build Test file list
+    # Build the same deterministic leakage-safe split as training.
     # ------------------------------------------------------------------------
 
-    test_files, test_labels = (
-        build_file_label_list(
-            TEST_DIR,
-            class_names,
-        )
-    )
+    (
+        _, _,
+        _, _,
+        test_files, test_labels,
+    ) = build_stratified_splits(DATASET_DIR, class_names)
 
     if not test_files:
 
         raise RuntimeError(
             f"No test images found under:\n"
-            f"{TEST_DIR}"
+            f"{DATASET_DIR}"
         )
 
     # ------------------------------------------------------------------------
