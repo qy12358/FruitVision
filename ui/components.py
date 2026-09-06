@@ -89,6 +89,37 @@ def confidence_gauge(confidence: float, ripeness_label: str):
     fig.update_layout(height=190, margin=dict(l=20, r=20, t=15, b=10))
     return fig
 
+def render_confidence_gauge(confidence: float, ripeness_label: str):
+    """Render a fluid gauge whose geometry and label scale together."""
+    value = max(0.0, min(100.0, float(confidence)))
+    colour = RIPENESS_COLORS.get(ripeness_label, PRIMARY_LIGHT)
+    st.markdown(
+        f"""<div class="confidence-gauge">
+        <svg viewBox="0 0 400 225" role="img"
+             aria-label="Prediction confidence: {value:.1f}%"
+             xmlns="http://www.w3.org/2000/svg">
+            <path d="M 35 195 A 165 165 0 0 1 365 195" fill="none"
+                  stroke="#E8F5E9" stroke-width="30" />
+            <path d="M 35 195 A 165 165 0 0 1 365 195" fill="none"
+                  stroke="#FFF8E1" stroke-width="30" pathLength="100"
+                  stroke-dasharray="80 100" />
+            <path d="M 35 195 A 165 165 0 0 1 365 195" fill="none"
+                  stroke="#FBE9E7" stroke-width="30" pathLength="100"
+                  stroke-dasharray="50 100" />
+            <path d="M 35 195 A 165 165 0 0 1 365 195" fill="none"
+                  stroke="{colour}" stroke-width="13" pathLength="100"
+                  stroke-dasharray="{value} 100" />
+            <g fill="#737B87" font-family="Arial, sans-serif" text-anchor="middle">
+                <text x="200" y="183" font-size="30">{value:.1f}%</text>
+                <text x="16" y="213" font-size="11">0</text>
+                <text x="200" y="12" font-size="11">50</text>
+                <text x="384" y="213" font-size="11">100</text>
+            </g>
+        </svg></div>""",
+        unsafe_allow_html=True,
+    )
+
+
 def empty_state(title: str, subtitle: str):
     st.markdown(
         f"""

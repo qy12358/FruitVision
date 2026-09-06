@@ -1,15 +1,20 @@
 """services / models for ManGo or Stay."""
 
+from __future__ import annotations
+
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from modules.blemish_detector import BlemishDetector
-from modules.mango_identifier import MangoIdentifier
 from modules.preprocessing import ImagePreprocessor
 from modules.quality_grader import QualityGrader
-from modules.ripeness_classifier import HybridRipenessClassifier
-from modules.yolo_mango_detector import YoloMangoDetector
+
+if TYPE_CHECKING:
+    from modules.blemish_detector import BlemishDetector
+    from modules.mango_identifier import MangoIdentifier
+    from modules.ripeness_classifier import HybridRipenessClassifier
+    from modules.yolo_mango_detector import YoloMangoDetector
 
 
 # ================================================================
@@ -60,6 +65,8 @@ def load_mango_identifier(
     Load the mango identification model once.
     """
 
+    from modules.mango_identifier import MangoIdentifier
+
     return MangoIdentifier(
         model_path=(
             "models/"
@@ -79,6 +86,8 @@ def load_ripeness_classifier(
     """
     Load the trained mango ripeness classifier once.
     """
+
+    from modules.ripeness_classifier import HybridRipenessClassifier
 
     return HybridRipenessClassifier(
         model_path=(
@@ -108,6 +117,8 @@ def load_yolo_mango_detector(
         ui/live_yolo_camera.py
     """
 
+    from modules.yolo_mango_detector import YoloMangoDetector
+
     return YoloMangoDetector(
         model_path=(
             "models/"
@@ -135,6 +146,8 @@ def load_blemish_detector(
     Current model:
         class 0 = defect
     """
+
+    from modules.blemish_detector import BlemishDetector
 
     return BlemishDetector(
         model_path=(

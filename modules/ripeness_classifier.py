@@ -862,6 +862,10 @@ class HybridRipenessClassifier:
             self.model_path,
             compile=False,
         )
+        self._infer = tf.function(
+            lambda inputs: self.model(inputs, training=False),
+            reduce_retracing=True,
+        )
 
     # =========================================================================
     # IMAGE BRANCH
@@ -1054,13 +1058,12 @@ class HybridRipenessClassifier:
             time.perf_counter()
         )
 
-        raw_probs = self.model.predict(
+        raw_probs = np.asarray(self._infer(
             {
                 "image_input": image_input,
                 "feature_input": feature_input,
             },
-            verbose=0,
-        )[0]
+        ))[0]
 
         inference_time_ms = (
             time.perf_counter()

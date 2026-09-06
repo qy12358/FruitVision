@@ -48,6 +48,10 @@ class MangoIdentifier:
                     self.model_path,
                     compile=False,
                 )
+                self._infer = tf.function(
+                    lambda inputs: self.model(inputs, training=False),
+                    reduce_retracing=True,
+                )
             except Exception:
                 # A broken optional model must not make the app crash.  The
                 # fallback below remains conservative and explainable.
@@ -349,7 +353,7 @@ class MangoIdentifier:
         rgb = processed["segmented_rgb"].astype(np.float32)
         rgb = processed.get("model_segmented_rgb", rgb)
         prediction = np.asarray(
-            self.model.predict(np.expand_dims(rgb, axis=0), verbose=0)
+            self._infer(np.expand_dims(rgb, axis=0))
         ).reshape(-1)
         if prediction.size == 0:
             return None

@@ -18,7 +18,7 @@ from modules.quality_grader import QualityGrader, SURFACE_GRADING_RULES, SURFACE
 from plotly.subplots import make_subplots
 from services.histograms import format_class_label
 from services.histograms import split_histogram_dict
-from ui.components import confidence_gauge
+from ui.components import render_confidence_gauge
 from ui.components import grade_badge
 from ui.components import metric_card
 from ui.components import ripeness_badge
@@ -26,6 +26,7 @@ from ui.education import render_hsv_histogram_tips
 
 import plotly.graph_objects as go
 import streamlit as st
+from ui.report_download import render_pdf_download
 
 
 def render_rejected_analysis(analysis: dict):
@@ -132,12 +133,13 @@ def render_live_assessment(analysis: dict, batch_id: str):
     result_columns = st.columns([1, 1.35], gap="large")
 
     with result_columns[0]:
-        st.image(
-            analysis["image"],
-            channels="BGR",
-            caption="Uploaded mango photo",
-            width="stretch",
-        )
+        with st.container(key="assessment_original_photo"):
+            st.image(
+                analysis["image"],
+                channels="BGR",
+                caption="Uploaded mango photo",
+                width="stretch",
+            )
 
     with result_columns[1]:
         if classification_error:
@@ -162,11 +164,7 @@ def render_live_assessment(analysis: dict, batch_id: str):
                 unsafe_allow_html=True,
             )
 
-            st.plotly_chart(
-                confidence_gauge(confidence, ripeness),
-                width="stretch",
-                config={"displayModeBar": False},
-            )
+            render_confidence_gauge(confidence, ripeness)
             st.caption("Prediction confidence")
 
             if confidence < 70.0:
@@ -222,8 +220,8 @@ def render_live_assessment(analysis: dict, batch_id: str):
     # PDF REPORT
     # ============================================================
 
-    try:
-        pdf_report = generate_pdf_report(
+    def build_pdf():
+        return generate_pdf_report(
             fruit_type=FRUIT_TYPE,
             batch_id=batch_id,
             ripeness=ripeness,
@@ -236,29 +234,10 @@ def render_live_assessment(analysis: dict, batch_id: str):
             report_details=build_report_details(analysis),
         )
 
-        pdf_error = None
-
-    except (
-        RuntimeError,
-        ValueError,
-    ) as exc:
-        pdf_report = None
-        pdf_error = str(exc)
-
-    st.download_button(
-        label="Export PDF",
-        data=pdf_report or b"",
-        file_name=(
-            f"mango-assessment-"
-            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf"
-        ),
-        mime="application/pdf",
-        disabled=pdf_report is None,
-        width="stretch",
+    render_pdf_download(
+        ("live", id(analysis), batch_id), build_pdf,
+        f"mango-assessment-{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf",
     )
-
-    if pdf_error:
-        st.caption(pdf_error)
 
     saved_id = st.session_state.get(
         "current_saved_id"
@@ -271,6 +250,9 @@ def render_live_assessment(analysis: dict, batch_id: str):
         )
 
     st.write("")
+
+    if not st.toggle("Show detailed analysis", key="show_live_analysis_details"):
+        return
 
     st.markdown(
         "<div class='section-title'>Understand this result</div>",
@@ -441,7 +423,7 @@ def render_live_assessment(analysis: dict, batch_id: str):
 
         else:
             st.caption(
-                "The AI uses the segmented mango image together with colour "
+                "The assessment uses the segmented mango image together with colour "
                 "and statistical measurements. The HSV values are supporting "
                 "features rather than fixed ripeness rules."
             )

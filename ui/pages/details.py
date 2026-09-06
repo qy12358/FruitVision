@@ -10,6 +10,7 @@ from services.histograms import split_histogram_dict
 from services.reports import report_data_from_record
 from services.storage import decode_png
 from services.storage import fetch_assessment
+from ui.report_download import render_pdf_download
 from ui.components import empty_state
 from ui.components import grade_badge
 from ui.components import metric_card
@@ -53,18 +54,16 @@ def render(history_df):
             h2.markdown(f"**Batch ID**  \n{record.get('batch_id') or 'Not specified'}")
             h3.markdown(f"**Date**  \n{created_text}")
 
-            _, pdf_report, report_error = report_data_from_record(record)
-            with st.container():
-                st.download_button(
-                    "Export PDF",
-                    data=pdf_report or b"",
-                    file_name=f"{record['assessment_id']}_report.pdf",
-                    mime="application/pdf",
-                    disabled=pdf_report is None,
-                    width="stretch",
-                )
-                if report_error:
-                    st.caption(report_error)
+            def build_pdf():
+                _, pdf, error = report_data_from_record(record)
+                if error:
+                    raise RuntimeError(error)
+                return pdf
+
+            render_pdf_download(
+                ("saved", selected_id), build_pdf,
+                f"{record['assessment_id']}_report.pdf",
+            )
 
             original = decode_png(record.get("original_image"), cv2.IMREAD_COLOR)
             processed = decode_png(record.get("processed_image"), cv2.IMREAD_COLOR)

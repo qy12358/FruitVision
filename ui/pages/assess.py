@@ -364,7 +364,7 @@ def render(history_df):
         st.image(
             preview_rgb,
             caption=caption,
-            width=520,
+            width="stretch",
         )
 
     # ============================================================

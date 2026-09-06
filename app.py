@@ -1,7 +1,7 @@
 """ManGo or Stay — run with: streamlit run app.py."""
 from services.storage import initialise_database, load_history_dataframe
 from ui.navigation import initialise_session, render_navigation
-from ui.pages import assess, details, history, home
+from importlib import import_module
 from ui.theme import apply_theme, configure_page
 
 
@@ -13,12 +13,12 @@ def main():
     history_df = load_history_dataframe()
     page = render_navigation(history_df)
     pages = {
-        "Home": home.render,
-        "Assess Mango": assess.render,
-        "Assessment Details": details.render,
-        "History & Reports": history.render,
+        "Home": "home",
+        "Assess Mango": "assess",
+        "Assessment Details": "details",
+        "History & Reports": "history",
     }
-    pages[page](history_df)
+    import_module(f"ui.pages.{pages[page]}").render(history_df)
 
 
 if __name__ == "__main__":

@@ -372,6 +372,15 @@ def apply_theme():
             background: #FFFFFF !important;
         }}
 
+        .confidence-gauge {{ width: 100%; background: white; }}
+        .confidence-gauge svg {{
+            display: block;
+            width: 100%;
+            max-width: 460px;
+            height: auto;
+            margin-inline: auto;
+        }}
+
         /* Keep photo previews compact while showing the entire image. */
         [data-testid="stImage"] {{
             width: min(100%, 480px) !important;
@@ -386,6 +395,34 @@ def apply_theme():
             max-height: min(360px, 45vh);
             object-fit: contain;
             margin-inline: auto;
+        }}
+
+        [data-testid="stImageContainer"] {{
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;
+        }}
+
+        /* Fit the full photo to the result area without changing image data. */
+        .st-key-assessment_original_photo [data-testid="stImage"],
+        .st-key-assessment_original_photo [data-testid="stImageContainer"] {{
+            width: 100% !important;
+            min-width: 0;
+        }}
+
+        .st-key-assessment_original_photo [data-testid="stImage"] img {{
+            width: 100% !important;
+            height: clamp(360px, 65vh, 640px) !important;
+            max-height: none;
+            object-fit: contain;
+            object-position: center;
+        }}
+
+        .st-key-assessment_original_photo [data-testid="stImageCaption"] {{
+            width: 100%;
+            text-align: center;
+            white-space: normal;
+            word-break: normal;
         }}
 
         [data-testid="stCameraInput"] {{
@@ -429,6 +466,86 @@ def apply_theme():
             border: none;
             border-top: 1px solid #E1E2DE;
             margin: 1.2rem 0;
+        }}
+
+        /* Shared responsive layout for all four pages and their detail panels. */
+        [data-testid="stColumn"] {{ min-width: 0; }}
+        .metric-value, .hero-advice, .top-brand-caption {{
+            overflow-wrap: anywhere;
+        }}
+        [data-testid="stDataFrame"], [data-testid="stTable"] {{
+            max-width: 100%;
+            overflow-x: auto;
+        }}
+
+        @media (max-width: 850px) {{
+            [data-testid="stImage"] {{ width: 100% !important; }}
+            [data-testid="stImage"] img {{
+                margin-inline: auto !important;
+                max-width: 100% !important;
+            }}
+            [data-testid="stMainBlockContainer"] {{
+                padding: 1.5rem 1rem 2.5rem;
+            }}
+            [data-testid="stHorizontalBlock"] {{
+                flex-direction: column !important;
+                gap: 1rem !important;
+            }}
+            [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {{
+                width: 100% !important;
+                flex: 1 1 auto !important;
+                min-width: 0 !important;
+            }}
+            .top-appbar {{ flex-wrap: wrap; gap: 12px; }}
+            .top-nav-divider {{ margin-bottom: 20px; }}
+            .page-title {{ font-size: clamp(26px, 6vw, 34px); }}
+            .page-subtitle {{ margin-bottom: 18px; }}
+            .metric-card {{ min-height: 88px; padding: 15px; }}
+            .metric-value {{ font-size: 26px; line-height: 1.15; }}
+            .hero-card, .grading-result {{ padding: 18px; }}
+            div.stButton > button, div.stDownloadButton > button {{
+                min-height: 44px;
+                width: 100%;
+            }}
+            .st-key-page div[role="radiogroup"] {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                width: 100%;
+            }}
+            .st-key-page div[role="radiogroup"] > label {{
+                min-height: 44px;
+                box-sizing: border-box;
+            }}
+            [data-baseweb="tab-list"] {{
+                gap: 16px;
+                overflow-x: auto;
+            }}
+            [data-baseweb="tab"] {{ flex-shrink: 0; min-height: 44px; }}
+            [data-testid="stFileUploaderDropzone"] {{
+                flex-wrap: wrap;
+                padding: 1rem;
+            }}
+            .st-key-assessment_original_photo [data-testid="stImage"] img {{
+                width: 100% !important;
+                height: clamp(260px, 60svh, 520px) !important;
+                max-height: none;
+                object-fit: contain;
+            }}
+            [data-testid="stCameraInput"] {{ width: 100%; max-width: 100%; }}
+            [data-testid="stCameraInput"] video {{ max-width: 100%; }}
+        }}
+
+        @media (max-width: 480px) {{
+            [data-testid="stMainBlockContainer"] {{ padding-inline: 0.75rem; }}
+            .top-brand-name {{ font-size: 23px; }}
+            .top-record-count {{ font-size: 11px; }}
+            .step-indicator {{ gap: 4px; justify-content: space-between; }}
+            .step {{ gap: 4px; padding: 6px; font-size: 10px; }}
+            .step-connector {{ display: none; }}
+            .empty-state {{ padding: 28px 16px; }}
+            .guide-card {{ padding: 15px; }}
+            [data-baseweb="input"] input,
+            [data-baseweb="textarea"] textarea {{ font-size: 16px; }}
         }}
         </style>
         """,
