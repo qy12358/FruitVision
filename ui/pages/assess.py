@@ -70,17 +70,12 @@ def render(history_df):
     batch_id = st.session_state.batch_id_input
 
     st.markdown(
-        f"""
-        <div class="fixed-produce">
-            <div class="fixed-produce-label">
-                Batch ID
-            </div>
-
-            <div class="fixed-produce-value">
-                {batch_id}
-            </div>
-        </div>
-        """,
+        (
+            '<div class="fixed-produce">'
+            '<div class="fixed-produce-label">Batch ID</div>'
+            f'<div class="fixed-produce-value">{batch_id}</div>'
+            '</div>'
+        ),
         unsafe_allow_html=True,
     )
 

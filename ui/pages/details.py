@@ -49,9 +49,9 @@ def render(history_df):
             created = record.get("created_at_dt")
             created_text = created.strftime("%Y-%m-%d %H:%M:%S") if pd.notna(created) else "Unavailable"
             h1, h2, h3 = st.columns(3)
-            h1.markdown(f"**Assessment ID**  \\n{record['assessment_id']}")
-            h2.markdown(f"**Batch ID**  \\n{record.get('batch_id') or 'Not specified'}")
-            h3.markdown(f"**Date**  \\n{created_text}")
+            h1.markdown(f"**Assessment ID**  \n{record['assessment_id']}")
+            h2.markdown(f"**Batch ID**  \n{record.get('batch_id') or 'Not specified'}")
+            h3.markdown(f"**Date**  \n{created_text}")
 
             report_text, pdf_report, report_error = report_data_from_record(record)
             d1, d2 = st.columns(2)
