@@ -3,50 +3,12 @@ import numpy as np
 
 
 class ImagePreprocessor:
-    """
-    Module 1 — Traditional Image Preprocessing
+    """Prepare native-resolution fruit masks and colour-preserving model inputs.
 
-    Processing pipeline:
-
-        Original Image
-             ↓
-        Resize
-             ↓
-        BGR → HSV
-             ↓
-        Gaussian Filtering
-             ↓
-        V-channel Contrast Enhancement
-             ↓
-        Mango Segmentation
-             ↓
-        Morphological Cleaning
-             ↓
-        Largest Component Selection
-             ↓
-        Segmented Mango Image
-             ↓
-        Module 2
-
-    Main techniques:
-
-        1. Resize
-        2. BGR → HSV conversion
-        3. Gaussian filtering
-        4. CLAHE contrast enhancement
-        5. HSV-based segmentation
-        6. Morphological opening
-        7. Morphological closing
-        8. Connected-component analysis
-
-    Important:
-
-        The segmentation thresholds are NOT ripeness thresholds.
-
-        They are only used to identify likely foreground/mango
-        pixels and remove background.
-
-        Ripeness classification is performed by Module 2.
+    Background colours are estimated in Lab space. GrabCut refines compact
+    foreground bodies, and thickness-based morphology removes thin stems
+    and leaves. HSV is used for seed hints and downstream colour features,
+    never as a hard boundary that discards pale or rotten skin.
     """
 
     # ========================================================================
@@ -304,459 +266,152 @@ class ImagePreprocessor:
     # ========================================================================
 
     def segment_mango(
-        self,
-        hsv_image,
-        keep_all_components=False,
-        source_bgr=None,
+        self, hsv_image, keep_all_components=False, source_bgr=None,
         return_layers=False,
     ):
+        """Separate compact fruit bodies using background colour and GrabCut.
+
+        HSV colour is a seed hint only. Pale highlights and dark lesions are
+        allowed inside the body. Thin attachments are removed geometrically,
+        since green skin and green leaves cannot be separated by hue alone.
+        All returned masks match the native input resolution.
         """
-        Segment the likely mango foreground.
+        native_h, native_w = hsv_image.shape[:2]
+        if native_h == 0 or native_w == 0:
+            raise ValueError("Cannot segment an empty image.")
+        if source_bgr is None:
+            source_bgr = cv2.cvtColor(hsv_image, cv2.COLOR_HSV2BGR)
+        if source_bgr.shape[:2] != (native_h, native_w):
+            raise ValueError("Segmentation source must match the HSV image size.")
+        scale = min(1.0, 640.0 / max(native_h, native_w))
+        width = max(1, round(native_w * scale))
+        height = max(1, round(native_h * scale))
+        source = cv2.resize(source_bgr, (width, height), interpolation=cv2.INTER_AREA)
+        empty = np.zeros((height, width), np.uint8)
+        candidate = empty.copy()
+        mask = empty.copy()
+        removed = empty.copy()
 
-        The segmentation uses HSV information.
-
-        The purpose is ONLY to separate the mango from
-        the background.
-
-        It does NOT determine:
-
-            ripe
-            semi_ripe
-            unripe
-            rotten
-
-        Those decisions belong to Module 2.
-
-        Returns:
-
-            segmented_hsv:
-                HSV image with background removed.
-
-            mask:
-                Binary mango mask.
-        """
-
-        # --------------------------------------------------------------------
-        # Extract HSV channels
-        # --------------------------------------------------------------------
-
-        h, s, v = cv2.split(
-            hsv_image
-        )
-
-        # --------------------------------------------------------------------
-        # Saturation mask
-        # --------------------------------------------------------------------
-        #
-        # Very low saturation areas are commonly:
-        #
-        #   - white background
-        #   - gray background
-        #   - neutral surfaces
-        #
-        # This is NOT a ripeness threshold.
-        #
-        # It is only a foreground candidate threshold.
-        #
-        # --------------------------------------------------------------------
-
-        saturation_mask = cv2.inRange(
-            s,
-            35,
-            255,
-        )
-
-        # --------------------------------------------------------------------
-        # Value mask
-        # --------------------------------------------------------------------
-        #
-        # Remove extremely dark pixels.
-        #
-        # This helps reduce:
-        #
-        #   - black background
-        #   - very dark noise
-        #
-        # --------------------------------------------------------------------
-
-        value_mask = cv2.inRange(
-            v,
-            35,
-            255,
-        )
-
-        # --------------------------------------------------------------------
-        # Combine masks
-        # --------------------------------------------------------------------
-
-        candidate = cv2.bitwise_and(
-            saturation_mask,
-            value_mask,
-        )
-
-        # Saturation/value alone marks colourful foliage and outdoor
-        # backgrounds as foreground.  Use GrabCut at the native resolution
-        # when the source image is available, while retaining the HSV
-        # candidate as a hard boundary.
-        candidate_mask = candidate.copy()
-        mask = candidate.copy()
-        # GrabCut is intentionally bounded to moderate images.  The mask is
-        # still returned at native resolution, but running five graph-cut
-        # iterations on a multi-megapixel upload is unnecessarily slow.
-        border_pixels = np.concatenate(
-            (
-                candidate[0, :], candidate[-1, :],
-                candidate[:, 0], candidate[:, -1],
+        if min(height, width) >= 12:
+            lab = cv2.cvtColor(
+                cv2.GaussianBlur(source, (5, 5), 0), cv2.COLOR_BGR2LAB,
+            ).astype(np.float32)
+            border_size = max(1, round(min(height, width) * 0.02))
+            border = np.zeros((height, width), bool)
+            border[:border_size] = True
+            border[-border_size:] = True
+            border[:, :border_size] = True
+            border[:, -border_size:] = True
+            samples = np.ascontiguousarray(lab[border][::3])
+            cv2.setRNGSeed(0)
+            _, _, centres = cv2.kmeans(
+                samples, min(5, len(samples)), None,
+                (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.2),
+                3, cv2.KMEANS_PP_CENTERS,
             )
-        )
-        border_candidate_ratio = float(np.mean(border_pixels > 0))
-        # Run the graph cut on a bounded proxy image, then restore the result
-        # to native resolution.  The old implementation skipped GrabCut for
-        # most uploaded photographs and therefore kept attached leaves in the
-        # fruit mask.
-        if (
-            source_bgr is not None
-            and source_bgr.shape[:2] == hsv_image.shape[:2]
-            and cv2.countNonZero(candidate) >= 0.01 * candidate.size
-        ):
-            native_height, native_width = candidate.shape[:2]
-            proxy_scale = min(
-                1.0,
-                640.0 / max(native_height, native_width),
+            distance = np.min(np.linalg.norm(
+                lab[:, :, None, :] - centres[None, None, :, :], axis=3,
+            ), axis=2)
+            candidate = np.where(distance > 18, 255, 0).astype(np.uint8)
+            candidate[border] = 0
+            candidate = cv2.morphologyEx(
+                candidate, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
             )
-            if proxy_scale < 1.0:
-                proxy_width = max(1, int(round(native_width * proxy_scale)))
-                proxy_height = max(1, int(round(native_height * proxy_scale)))
-                grab_source = cv2.resize(
-                    source_bgr,
-                    (proxy_width, proxy_height),
-                    interpolation=cv2.INTER_AREA,
-                )
-                grab_hsv = cv2.resize(
-                    hsv_image,
-                    (proxy_width, proxy_height),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-                grab_candidate = cv2.resize(
-                    candidate,
-                    (proxy_width, proxy_height),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-            else:
-                grab_source = source_bgr
-                grab_hsv = hsv_image
-                grab_candidate = candidate
+            contours, _ = cv2.findContours(candidate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(candidate, contours, -1, 255, cv2.FILLED)
 
-            grab_h, grab_s, grab_v = cv2.split(grab_hsv)
-            height, width = grab_candidate.shape[:2]
-            grabcut_mask = np.full(
-                (height, width), cv2.GC_PR_BGD, dtype=np.uint8
+            thickness = cv2.distanceTransform(candidate, cv2.DIST_L2, 5)
+            radius = max(3, round(float(thickness.max()) * 0.28))
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1),
             )
-            border = max(2, int(round(min(height, width) * 0.025)))
-            grabcut_mask[:border, :] = cv2.GC_BGD
-            grabcut_mask[-border:, :] = cv2.GC_BGD
-            grabcut_mask[:, :border] = cv2.GC_BGD
-            grabcut_mask[:, -border:] = cv2.GC_BGD
-            seed_size = max(3, int(round(min(height, width) * 0.025)))
-            if seed_size % 2 == 0:
-                seed_size += 1
-            # Warm hues are useful sure-foreground seeds for yellow/orange
-            # mangoes, apples and citrus.  Saturated green seeds support
-            # green mangoes but are deliberately not taken from the whole
-            # candidate mask, otherwise an outdoor leafy background becomes
-            # a single giant foreground seed.
-            warm_seed = (
-                (((grab_h <= 35) | (grab_h >= 165))
-                 & (grab_s >= 70) & (grab_v >= 45))
-                & (grab_candidate > 0)
-            )
-            green_seed = (
-                ((grab_h >= 35) & (grab_h <= 95)
-                 & (grab_s >= 75) & (grab_v <= 220))
-                & (grab_candidate > 0)
-            )
-            # Prefer warm fruit pixels because green foliage is a common
-            # false foreground.  Fall back to green only when the image has
-            # no meaningful warm fruit evidence (e.g. an unripe green mango
-            # on a plain background).
-            fruit_seed = warm_seed
-            if cv2.countNonZero(fruit_seed.astype(np.uint8)) < 0.01 * height * width:
-                fruit_seed = green_seed
-            fruit_seed = fruit_seed.astype(np.uint8) * 255
-            fruit_seed = cv2.morphologyEx(
-                fruit_seed,
-                cv2.MORPH_OPEN,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-            )
-            fruit_seed = cv2.morphologyEx(
-                fruit_seed,
-                cv2.MORPH_CLOSE,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
-            )
-            grabcut_mask[fruit_seed == 0] = cv2.GC_PR_BGD
-            grabcut_mask[grab_candidate == 0] = cv2.GC_BGD
-            grabcut_mask[fruit_seed > 0] = cv2.GC_PR_FGD
+            bodies = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel)
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(bodies)
+            if count > 1:
+                largest = int(stats[1:, cv2.CC_STAT_AREA].max())
+                for label in range(1, count):
+                    if stats[label, cv2.CC_STAT_AREA] >= max(bodies.size * 0.015, largest * 0.12):
+                        mask[labels == label] = 255
 
-            seed_kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (seed_size, seed_size)
+            # Probable foreground may include highlights/lesions. Certain
+            # foreground uses colour evidence to avoid forcing neutral
+            # shadows or background patches into the final fruit mask.
+            graph_mask = np.full(mask.shape, cv2.GC_PR_BGD, np.uint8)
+            graph_mask[mask > 0] = cv2.GC_PR_FGD
+            sure = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+            hue, saturation, _ = cv2.split(cv2.cvtColor(source, cv2.COLOR_BGR2HSV))
+            blue, green, red = cv2.split(source.astype(np.int16))
+            colour = (
+                ((saturation >= 35) & (green - blue >= 15) & (hue >= 20) & (hue <= 100))
+                | ((saturation >= 55) & ((hue <= 25) | (hue >= 165)))
             )
-            sure_foreground = cv2.erode(fruit_seed, seed_kernel)
-            if cv2.countNonZero(sure_foreground) == 0:
-                sure_foreground = cv2.erode(
-                    fruit_seed,
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
-                )
-            grabcut_mask[sure_foreground > 0] = cv2.GC_FGD
-
-            if np.any(grabcut_mask == cv2.GC_FGD):
-                background_model = np.zeros((1, 65), np.float64)
-                foreground_model = np.zeros((1, 65), np.float64)
+            colour_seed = np.where(colour, sure, 0).astype(np.uint8)
+            if np.any(colour_seed):
+                sure = colour_seed
+            graph_mask[sure > 0] = cv2.GC_FGD
+            graph_mask[border] = cv2.GC_BGD
+            if np.any(graph_mask == cv2.GC_FGD):
                 try:
                     cv2.grabCut(
-                        grab_source,
-                        grabcut_mask,
-                        None,
-                        background_model,
-                        foreground_model,
-                        5,
-                        cv2.GC_INIT_WITH_MASK,
+                        source, graph_mask, None, np.zeros((1, 65), np.float64),
+                        np.zeros((1, 65), np.float64), 5, cv2.GC_INIT_WITH_MASK,
                     )
-                    grabcut_foreground = np.where(
-                        (grabcut_mask == cv2.GC_FGD)
-                        | (grabcut_mask == cv2.GC_PR_FGD),
-                        255,
-                        0,
+                    mask = np.where(
+                        (graph_mask == cv2.GC_FGD) | (graph_mask == cv2.GC_PR_FGD), 255, 0,
                     ).astype(np.uint8)
-                    if proxy_scale < 1.0:
-                        grabcut_foreground = cv2.resize(
-                            grabcut_foreground,
-                            (native_width, native_height),
-                            interpolation=cv2.INTER_NEAREST,
-                        )
-                    mask = cv2.bitwise_and(
-                        grabcut_foreground,
-                        candidate,
-                    )
-                    # A graph cut that retains almost the whole frame has
-                    # failed to separate a natural background.  In that
-                    # case, use the conservative fruit-colour seed instead
-                    # of returning a scene-sized foreground mask.
-                    if (
-                        cv2.countNonZero(mask)
-                        > 0.72 * mask.shape[0] * mask.shape[1]
-                        and cv2.countNonZero(fruit_seed) > 0
-                    ):
-                        if proxy_scale < 1.0:
-                            fruit_seed = cv2.resize(
-                                fruit_seed,
-                                (native_width, native_height),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-                        mask = cv2.bitwise_and(fruit_seed, candidate)
                 except cv2.error:
-                    # Keep the deterministic candidate for degenerate or
-                    # very small inputs where GrabCut cannot initialize.
-                    mask = candidate.copy()
-
-        # ================================================================
-        # LEAF LAYER
-        # ================================================================
-        # A green leaf and an unripe green mango are visually similar.  Only
-        # remove green regions when the same object also contains a meaningful
-        # warm fruit core (yellow/orange/brown).  This protects all-green
-        # unripe mangoes while removing the obvious green leaves attached to
-        # yellow mangoes in product photographs.
-        leaf_mask = np.zeros_like(mask)
-        if cv2.countNonZero(mask) > 0:
-            warm_pixels = (
-                (((h <= 38) | (h >= 165)) & (s >= 55) & (v >= 35))
-                & (mask > 0)
+                    # Preserve the compact body candidate if graph fitting
+                    # cannot initialize on a uniform or degenerate image.
+                    pass
+            opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            removed = cv2.subtract(mask, opened)
+            # Seal narrow cuts left by specular highlights or lesions after
+            # removing thin attachments. This does not reconnect detached
+            # leaves because the opening has already removed them.
+            # Closing dilates before eroding. Give the dilation room outside
+            # the image; otherwise a constant-zero border cuts a radius-wide
+            # strip off foreground near the frame (flat tops/ends on fruit).
+            padded = cv2.copyMakeBorder(
+                opened, radius, radius, radius, radius,
+                cv2.BORDER_CONSTANT, value=0,
             )
-            # HSV hue is not sufficient here: the yellow-green leaf in the
-            # supplied mango2 photograph has almost the same hue as the
-            # mango skin.  In BGR, foliage is usually green-dominant whereas
-            # yellow mango skin is red-dominant.  Use both signals.
-            green_pixels = (
-                ((h >= 25) & (h <= 100) & (s >= 45) & (v >= 30))
-                & (mask > 0)
-            )
-            if source_bgr is not None and source_bgr.shape[:2] == mask.shape:
-                blue_channel, green_channel, red_channel = cv2.split(source_bgr)
-                green_dominant = (
-                    (green_channel.astype(np.float32)
-                     > 1.05 * red_channel.astype(np.float32))
-                    & (green_channel.astype(np.float32)
-                       > 1.05 * blue_channel.astype(np.float32))
-                )
-                green_pixels &= green_dominant
-            fruit_area = float(cv2.countNonZero(mask))
-            warm_fraction = float(np.count_nonzero(warm_pixels)) / fruit_area
-            if warm_fraction >= 0.04:
-                green_layer = (green_pixels.astype(np.uint8) * 255)
-                leaf_kernel_size = max(
-                    5,
-                    int(round(min(mask.shape[:2]) * 0.012)) | 1,
-                )
-                green_layer = cv2.morphologyEx(
-                    green_layer,
-                    cv2.MORPH_OPEN,
-                    cv2.getStructuringElement(
-                        cv2.MORPH_ELLIPSE,
-                        (leaf_kernel_size, leaf_kernel_size),
-                    ),
-                )
-                num_green, green_labels, green_stats, _ = (
-                    cv2.connectedComponentsWithStats(
-                        green_layer,
-                        connectivity=8,
+            mask = cv2.morphologyEx(
+                padded, cv2.MORPH_CLOSE, kernel,
+                borderType=cv2.BORDER_CONSTANT, borderValue=0,
+            )[radius:-radius, radius:-radius]
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(mask, contours, -1, 255, cv2.FILLED)
+            count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+            clean = np.zeros_like(mask)
+            if count > 1:
+                largest = int(stats[1:, cv2.CC_STAT_AREA].max())
+                for label in range(1, count):
+                    x, y, body_w, body_h, area = stats[label]
+                    opposite_edges = (
+                        (x <= border_size and x + body_w >= width - border_size)
+                        or (y <= border_size and y + body_h >= height - border_size)
                     )
-                )
-                for label in range(1, num_green):
-                    component_area = green_stats[label, cv2.CC_STAT_AREA]
-                    component_width = green_stats[label, cv2.CC_STAT_WIDTH]
-                    component_height = green_stats[label, cv2.CC_STAT_HEIGHT]
-                    short_side = max(1, min(component_width, component_height))
-                    long_side = max(component_width, component_height)
-                    component_ratio = long_side / short_side
                     if (
-                        component_area >= max(25, 0.002 * fruit_area)
-                        and component_area <= 0.25 * fruit_area
-                        and component_ratio >= 2.2
+                        area >= max(mask.size * 0.015, largest * 0.12)
+                        and max(body_w, body_h) / max(1, min(body_w, body_h)) < 3.2
+                        and not opposite_edges
                     ):
-                        leaf_mask[green_labels == label] = 255
+                        clean[labels == label] = 255
+            mask = clean
+            if not keep_all_components and np.any(mask):
+                count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+                largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
-                # The color layer can be broken into small pieces by veins or
-                # highlights.  An elongated green contour is still a leaf;
-                # remove it from the final fruit mask but retain it for the
-                # technical visualization.
-                mask = cv2.bitwise_and(
-                    mask,
-                    cv2.bitwise_not(leaf_mask),
-                )
-
-        # ====================================================================
-        # MORPHOLOGICAL PROCESSING
-        # ====================================================================
-
-        # --------------------------------------------------------------------
-        # Create elliptical kernel
-        # --------------------------------------------------------------------
-
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (5, 5),
-        )
-
-        # --------------------------------------------------------------------
-        # Opening
-        # --------------------------------------------------------------------
-        #
-        # Removes small isolated foreground noise.
-        #
-        # Erosion → removes small objects.
-        # Dilation → restores the main object.
-        #
-        # --------------------------------------------------------------------
-
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_OPEN,
-            kernel,
-        )
-
-        # --------------------------------------------------------------------
-        # Closing
-        # --------------------------------------------------------------------
-        #
-        # Fills small holes and connects nearby regions.
-        #
-        # Dilation → closes small gaps.
-        # Erosion → restores object boundary.
-        #
-        # --------------------------------------------------------------------
-
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
-        )
-
-        # Dark rotten areas and deep shadows can fall below the HSV value
-        # candidate threshold.  They are holes inside the fruit, not
-        # background.  Fill only external fruit contours so the native
-        # silhouette is preserved and the dark pixels remain available in
-        # the original colour image for damage/ripeness analysis.
-        external_contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-        if external_contours:
-            filled_mask = np.zeros_like(mask)
-            cv2.drawContours(
-                filled_mask,
-                external_contours,
-                -1,
-                255,
-                thickness=cv2.FILLED,
-            )
-            if cv2.countNonZero(filled_mask) >= cv2.countNonZero(mask):
-                mask = filled_mask
-
-        # ====================================================================
-        # CONNECTED COMPONENT ANALYSIS
-        # ====================================================================
-
-        num_labels, labels, stats, _ = (
-            cv2.connectedComponentsWithStats(
-                mask,
-                connectivity=8,
-            )
-        )
-
-        if num_labels > 1 and not keep_all_components:
-
-            # --------------------------------------------------------------
-            # Ignore label 0 because it represents the background.
-            # --------------------------------------------------------------
-
-            largest_label = 1 + np.argmax(
-                stats[
-                    1:,
-                    cv2.CC_STAT_AREA,
-                ]
-            )
-
-            mask = np.where(
-                labels == largest_label,
-                255,
-                0,
-            ).astype(
-                np.uint8
-            )
-
-        # ====================================================================
-        # APPLY MASK
-        # ====================================================================
-
-        segmented_hsv = cv2.bitwise_and(
-            hsv_image,
-            hsv_image,
-            mask=mask,
-        )
-
+        mask = cv2.resize(mask, (native_w, native_h), interpolation=cv2.INTER_NEAREST)
+        candidate = cv2.resize(candidate, (native_w, native_h), interpolation=cv2.INTER_NEAREST)
+        removed = cv2.resize(removed, (native_w, native_h), interpolation=cv2.INTER_NEAREST)
+        removed = cv2.bitwise_and(removed, cv2.bitwise_not(mask))
+        segmented = cv2.bitwise_and(hsv_image, hsv_image, mask=mask)
         if return_layers:
-            return (
-                segmented_hsv,
-                mask,
-                candidate_mask,
-                leaf_mask,
-            )
-        return segmented_hsv, mask
-
-    # ========================================================================
-    # APPLY MASK TO RGB IMAGE
-    # ========================================================================
+            return segmented, mask, candidate, removed
+        return segmented, mask
 
     def apply_mask_to_rgb(
         self,
@@ -820,32 +475,11 @@ class ImagePreprocessor:
         keep_all_components=False,
         mask_override=None,
     ):
-        """
-        Execute the complete Module 1 preprocessing pipeline.
+        """Segment fruit bodies and return native masks plus letterboxed inputs.
 
-        Pipeline:
-
-            Original Image
-                 ↓
-            Resize
-                 ↓
-            BGR → HSV
-                 ↓
-            Gaussian Filtering
-                 ↓
-            CLAHE on V channel
-                 ↓
-            HSV Segmentation
-                 ↓
-            Morphological Opening
-                 ↓
-            Morphological Closing
-                 ↓
-            Largest Connected Component
-                 ↓
-            Segmented Mango
-                 ↓
-            Module 2
+        Gaussian/contrast images remain available for diagnostics. The
+        segmentation uses the source BGR image, and both classification and
+        defect analysis retain the original fruit colour values.
         """
 
         if image is None or image.ndim != 3 or image.shape[2] != 3:
@@ -921,7 +555,7 @@ class ImagePreprocessor:
             leaf_mask = np.zeros_like(mask)
 
         # Keep the original colour values for the classifier.  The enhanced
-        # HSV image is only used to make the foreground mask.  Applying CLAHE
+        # HSV image is retained for diagnostics only. Applying CLAHE
         # to the ripeness input would change the colour evidence the model is
         # supposed to learn from.
         segmented_hsv = cv2.bitwise_and(

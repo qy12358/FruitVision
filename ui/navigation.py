@@ -62,7 +62,7 @@ def render_navigation(history_df):
 
     with action_col:
         if page != "Assess Mango":
-            if st.button("New assessment", use_container_width=True, type="primary", key="top_new_assessment"):
+            if st.button("New assessment", width="stretch", type="primary", key="top_new_assessment"):
                 st.session_state.current_analysis = None
                 st.session_state.current_image_hash = None
                 st.session_state.current_saved_id = None

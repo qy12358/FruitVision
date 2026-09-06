@@ -7,6 +7,26 @@ requirements in the grading specification.
 
 import math
 
+LEGACY_SURFACE_GRADING_RULES = [
+    ('Less than 1.50%', 'Low', 'Premium'),
+    ('1.50% to less than 5.00%', 'Medium', 'Grade 1'),
+    ('5.00% to 10.00% inclusive', 'High', 'Grade 2'),
+    ('Above 10.00%', 'High', 'Reject'),
+]
+
+SURFACE_GRADING_HEADERS = ('Ripeness stage', 'Total defect <= 5%',
+                           'Total defect > 5% to <= 10%', 'Total defect > 10%')
+SURFACE_GRADING_RULES = [
+    ('Ripe', 'Premium', 'Grade 1', 'Reject'),
+    ('Semi-Ripe', 'Grade 1', 'Grade 2', 'Reject'),
+    ('Unripe', 'Grade 2', 'Grade 2', 'Reject'),
+    ('Rotten', 'Reject', 'Reject', 'Reject'),
+]
+
+
+def surface_severity(coverage):
+    return 'Low' if coverage < 1.5 else 'Medium' if coverage < 5.0 else 'High'
+
 
 class QualityGrader:
     """Assign the requirements-based mango surface-quality grade."""
@@ -14,6 +34,32 @@ class QualityGrader:
     PREMIUM_LIMIT = 5.0
     MAXIMUM_ACCEPTABLE_LIMIT = 10.0
     VALID_RIPENESS = {"ripe", "semi_ripe", "unripe", "rotten"}
+
+    def grade_defects(self, defect_coverage, ripeness=None):
+        """Apply the ripeness/total-defect matrix; severity remains coverage-only."""
+        errors = []
+        coverage = self._validate_percentage('Defect coverage', defect_coverage, errors)
+        stage = self._normalise_ripeness(ripeness)
+        if stage not in self.VALID_RIPENESS:
+            errors.append('Ripeness must be Ripe, Semi-Ripe, Unripe, or Rotten')
+        if errors:
+            return dict(available=False, grade='Unavailable', defect_coverage=coverage,
+                        ripeness=ripeness,
+                        severity=surface_severity(coverage) if coverage is not None else 'Unavailable',
+                        reason='; '.join(errors), reasons=errors,
+                        grading_basis='surface_defects_v2')
+        severity = surface_severity(coverage)
+        row = next(row for row in SURFACE_GRADING_RULES
+                   if self._normalise_ripeness(row[0]) == stage)
+        column = 1 if coverage <= 5 else 2 if coverage <= 10 else 3
+        grade = row[column]
+        reason = (f'Detected surface defects cover {coverage:.2f}% of the visible mango area. '
+                  f'{row[0]} ripeness with {SURFACE_GRADING_HEADERS[column].lower()} gives {grade}.')
+        if stage == 'rotten':
+            reason = f'Rotten mangoes are rejected regardless of total defect coverage ({coverage:.2f}%).'
+        return dict(available=True, grade=grade, defect_coverage=coverage,
+                    blemish_coverage=coverage, damage_coverage=None, severity=severity,
+                    ripeness=ripeness, reason=reason, reasons=[reason], grading_basis='surface_defects_v2')
 
     @staticmethod
     def _normalise_ripeness(value):

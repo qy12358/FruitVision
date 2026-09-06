@@ -52,7 +52,7 @@ def render(history_df):
         )
         distribution_fig.update_traces(textposition="inside", textinfo="percent+label")
         distribution_fig.update_layout(height=380, margin=dict(l=20, r=20, t=20, b=20), showlegend=False)
-        st.plotly_chart(distribution_fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(distribution_fig, width="stretch", config={"displayModeBar": False})
 
         left, right = st.columns([6, 4])
         with left:
@@ -64,15 +64,15 @@ def render(history_df):
             st.dataframe(
                 recent[["ID", "Batch ID", "Ripeness", "Confidence", "Grade", "Defect %", "Date"]],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         with right:
             st.markdown("<div class='section-title'>Current records</div>", unsafe_allow_html=True)
             latest = history_df.iloc[0]
-            st.markdown(f"**Latest assessment**  \\n{latest['ID']}")
-            st.markdown(f"**Latest ripeness**  \\n{latest['Ripeness'] or 'Unavailable'}")
-            st.markdown(f"**Latest quality grade**  \\n{latest['Grade'] or 'Unavailable'}")
-            if st.button("Open latest assessment", use_container_width=True):
+            st.markdown(f"**Latest assessment**  \\:{latest['ID']}")
+            st.markdown(f"**Latest ripeness**  \\:{latest['Ripeness'] or 'Unavailable'}")
+            st.markdown(f"**Latest quality grade**  \\:{latest['Grade'] or 'Unavailable'}")
+            if st.button("Open latest assessment", width="stretch"):
                 st.session_state.selected_assessment_id = latest["ID"]
                 go_to("Assessment Details")
 
@@ -98,6 +98,6 @@ def render(history_df):
         """,
         unsafe_allow_html=True,
     )
-    if st.button("Start an assessment", type="primary", use_container_width=True, key="home_start_assessment"):
+    if st.button("Start an assessment", type="primary", width="stretch", key="home_start_assessment"):
         go_to("Assess Mango")
 
