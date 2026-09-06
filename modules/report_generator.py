@@ -8,6 +8,18 @@ from xml.sax.saxutils import escape
 
 import cv2
 import numpy as np
+from modules.quality_grader import (
+    SURFACE_GRADING_RULES, SURFACE_GRADING_HEADERS, LEGACY_SURFACE_GRADING_RULES,
+)
+
+
+def surface_rule_reference(quality):
+    if quality.get('grading_basis') == 'surface_defects_v2':
+        return (SURFACE_GRADING_HEADERS, SURFACE_GRADING_RULES,
+                'The grade combines ripeness with total surface-defect coverage. '
+                'Rotten mangoes are always rejected. The 5% and 10% upper limits are inclusive.')
+    return (('Defect coverage', 'Severity', 'Surface quality grade'), LEGACY_SURFACE_GRADING_RULES,
+            'These stored assessment rules use total surface-defect coverage. Ripeness is reported separately.')
 
 GRADING_RULES = [
     ('Ripe', '<=5%', '<=5%', 'Premium', 'Best maturity condition and minimal surface defects'),
@@ -52,6 +64,9 @@ def build_report_details(analysis):
         'accepted_count', 'classification_error',
     )}
     details.update(version=1, images=images, original_size=source.get('original_size'),
+                   defect_pixel_area=defects.get('defect_pixel_area'),
+                   mango_pixel_area=defects.get('mango_pixel_area'),
+                   component_count=defects.get('component_count'),
                    blemish_pixel_area=defects.get('blemish_pixel_area'),
                    damage_pixel_area=defects.get('damage_pixel_area'))
     details['objects'] = [dict(object=o['object_index'], ripeness=r['prediction'],
@@ -104,10 +119,18 @@ def generate_report_string(fruit_type='Harumanis mango', batch_id='', ripeness=N
              '## Preprocessing', 'Background estimation, GrabCut body extraction, thin-attachment removal and model resize.',
              f'Fruit pixels: {d.get("mango_pixel_count", "Unavailable")}', '', '## Ripeness probabilities']
     lines.extend(f'- {k}: {format_coverage(v)}' for k, v in (d.get('probabilities') or {}).items())
-    lines += ['', '## Grading reference', '| Ripeness | Blemish | Damage | Grade | Interpretation |',
-              '|---|---|---|---|---|']
-    lines.extend('| ' + ' | '.join(row) + ' |' for row in GRADING_RULES)
-    lines += ['', 'Reference: user-provided rule based grading table. Reject conditions take precedence.']
+    if q.get('grading_basis') in ('surface_defects_v1', 'surface_defects_v2'):
+        headers, rules, note = surface_rule_reference(q)
+        lines[6:8] = [f'Defect coverage: {format_coverage(q.get("defect_coverage"))}']
+        lines += ['', '## Grading reference', '| ' + ' | '.join(headers) + ' |',
+                  '|' + '---|' * len(headers)]
+        lines.extend('| ' + ' | '.join(row) + ' |' for row in rules)
+        lines += ['', note]
+    else:
+        lines += ['', '## Grading reference', '| Ripeness | Blemish | Damage | Grade | Interpretation |',
+                  '|---|---|---|---|---|']
+        lines.extend('| ' + ' | '.join(row) + ' |' for row in GRADING_RULES)
+        lines += ['', 'Reference: user-provided rule based grading table. Reject conditions take precedence.']
     return '\n'.join(lines)
 
 
@@ -124,6 +147,7 @@ def generate_pdf_report(fruit_type='Harumanis mango', batch_id='', ripeness=None
     except ImportError as exc:
         raise RuntimeError('PDF export requires ReportLab: python -m pip install reportlab') from exc
     q, d = quality_result or {}, report_details or {}
+    surface_only = q.get('grading_basis') in ('surface_defects_v1', 'surface_defects_v2')
     pictures = d.get('images', {})
     green, ink, pale, line = [colors.HexColor(c) for c in ('#315E4D', '#25342F', '#EEF4F0', '#D4DED8')]
     styles = getSampleStyleSheet()
@@ -178,6 +202,9 @@ def generate_pdf_report(fruit_type='Harumanis mango', batch_id='', ripeness=None
     summary = [['Result','Assessment'], ['Ripeness',ripeness or 'Unavailable'], ['Confidence',format_coverage(confidence)],
                ['Blemish coverage',format_coverage(q.get('blemish_coverage'))], ['Damage coverage',format_coverage(q.get('damage_coverage'))],
                ['Overall grade',q.get('grade','Unavailable')], ['Severity',severity or 'Unavailable'], ['Mangoes detected',metric(d.get('accepted_count'))]]
+    if surface_only:
+        summary[3:5] = [['Defect coverage', format_coverage(q.get('defect_coverage'))],
+                        ['Defect regions', metric(d.get('component_count'))]]
     layout = Table([[[photo(original_image,205,260), Spacer(1,6), p('User input image','SmallCell')],
                      [table(summary,[100,width-333],True)]]], colWidths=[223,width-223])
     layout.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'), ('LEFTPADDING',(0,0),(-1,-1),0), ('RIGHTPADDING',(0,0),(-1,-1),10)]))
@@ -216,20 +243,34 @@ def generate_pdf_report(fruit_type='Harumanis mango', batch_id='', ripeness=None
         story += [Spacer(1,16), p('Individual mango predictions','Section'), Spacer(1,10),
                   table([['Object','Ripeness','Confidence']]+[[o['object'],o['ripeness'],format_coverage(o['confidence'])] for o in d['objects']], [70,width-170,100],True)]
     story += [PageBreak()]
-    section('4. Blemish and damage analysis')
-    story += [table([['Measure','Blemish','Damage'], ['Coverage',format_coverage(q.get('blemish_coverage')),format_coverage(q.get('damage_coverage'))],
-                     ['Pixel area',metric(d.get('blemish_pixel_area')),metric(d.get('damage_pixel_area'))]], [width*.4,width*.3,width*.3],True), Spacer(1,10)]
-    grid([('Blemish mask',pictures.get('blemish_mask')), ('Damage-only mask',pictures.get('damage_only_mask')),
-          ('Combined defect mask',pictures.get('damage_mask')), ('Defect overlay',overlay_image if overlay_image is not None else pictures.get('overlay'))],165)
-    story += [p('Detected types: '+(', '.join(defect_types or []) or 'Unavailable')), Spacer(1,6),
-              p('Coverage uses the stored detector measurements. Combined defect coverage can differ from the sum when masks overlap.'), PageBreak()]
-    section('5. Overall grade and rule reference')
-    story += [table([['Final grade',q.get('grade','Unavailable')], ['Reason',q.get('reason','Unavailable')],
-                     ['Ripeness',ripeness or 'Unavailable'], ['Blemish coverage',format_coverage(q.get('blemish_coverage'))],
-                     ['Damage coverage',format_coverage(q.get('damage_coverage'))]],[140,width-140]), Spacer(1,18)]
-    story += [table([['Ripeness','Blemish coverage','Damage coverage','Final grade','Interpretation']]+GRADING_RULES,
-                    [65,86,86,64,width-301],True), Spacer(1,12),
-              p('Reference: user-provided rule based grading.png. Reject rules take precedence: Rotten, blemish above 10%, or damage above 10%. The 5% and 10% limits are inclusive where indicated.','SmallCell')]
+    section('4. Surface defect analysis' if surface_only else '4. Blemish and damage analysis')
+    if surface_only:
+        story += [table([['Defect coverage', format_coverage(q.get('defect_coverage'))],
+                         ['Severity', q.get('severity')], ['Defect regions', metric(d.get('component_count'))],
+                         ['Defect pixels / mango pixels', f'{metric(d.get("defect_pixel_area"))} / {metric(d.get("mango_pixel_area"))}']],
+                        [170,width-170]), Spacer(1,10)]
+        grid([('Detected defect mask',pictures.get('blemish_mask')),
+              ('Defect overlay',overlay_image if overlay_image is not None else pictures.get('overlay'))],220)
+        story += [p('Coverage = detected defect pixels / visible mango pixels x 100. The model detects one surface-defect class; separate damage coverage is not measured.'), PageBreak()]
+        section('5. Surface quality grade and rule reference')
+        headers, rules, note = surface_rule_reference(q)
+        story += [p(q.get('reason')), Spacer(1,18),
+                  table([headers]+rules, [width/len(headers)]*len(headers),True), Spacer(1,12),
+                  p(note,'SmallCell')]
+    else:
+        story += [table([['Measure','Blemish','Damage'], ['Coverage',format_coverage(q.get('blemish_coverage')),format_coverage(q.get('damage_coverage'))],
+                         ['Pixel area',metric(d.get('blemish_pixel_area')),metric(d.get('damage_pixel_area'))]], [width*.4,width*.3,width*.3],True), Spacer(1,10)]
+        grid([('Blemish mask',pictures.get('blemish_mask')), ('Damage-only mask',pictures.get('damage_only_mask')),
+              ('Combined defect mask',pictures.get('damage_mask')), ('Defect overlay',overlay_image if overlay_image is not None else pictures.get('overlay'))],165)
+        story += [p('Detected types: '+(', '.join(defect_types or []) or 'Unavailable')), Spacer(1,6),
+                  p('Coverage uses the stored detector measurements. Combined defect coverage can differ from the sum when masks overlap.'), PageBreak()]
+        section('5. Overall grade and rule reference')
+        story += [table([['Final grade',q.get('grade','Unavailable')], ['Reason',q.get('reason','Unavailable')],
+                         ['Ripeness',ripeness or 'Unavailable'], ['Blemish coverage',format_coverage(q.get('blemish_coverage'))],
+                         ['Damage coverage',format_coverage(q.get('damage_coverage'))]],[140,width-140]), Spacer(1,18)]
+        story += [table([['Ripeness','Blemish coverage','Damage coverage','Final grade','Interpretation']]+GRADING_RULES,
+                        [65,86,86,64,width-301],True), Spacer(1,12),
+                  p('Reference: user-provided rule based grading.png. Reject rules take precedence: Rotten, blemish above 10%, or damage above 10%. The 5% and 10% limits are inclusive where indicated.','SmallCell')]
     output = BytesIO()
     doc = SimpleDocTemplate(output,pagesize=A4,rightMargin=40,leftMargin=40,topMargin=42,bottomMargin=42,
                             title='Mango Assessment Report',author='ManGo or Stay')

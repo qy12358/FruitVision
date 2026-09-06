@@ -41,17 +41,6 @@ def render(history_df):
         ),
     )
 
-    st.markdown(
-        """
-        <div class="notice-box">
-            <strong>For a reliable assessment</strong><br>
-            Keep the whole mango visible, use even lighting,
-            avoid strong glare or deep shadows, and place the
-            fruit against a simple background where possible.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
     # ============================================================
     # SESSION STATE FOR YOLO
@@ -401,7 +390,7 @@ def render(history_df):
             "Analyse mango",
             type="primary",
             disabled=not image_ready,
-            use_container_width=True,
+            width="stretch",
             key="analyse_normal_mango",
         )
 

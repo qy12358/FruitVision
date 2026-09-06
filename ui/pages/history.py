@@ -58,7 +58,7 @@ def render(history_df):
             data=csv_data,
             file_name=f"mango-assessment-history-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             disabled=filtered.empty,
         )
 
@@ -78,5 +78,5 @@ def render(history_df):
             st.dataframe(
                 display[["ID", "Batch ID", "Ripeness", "Confidence", "Grade", "Defect %", "Severity", "Date"]],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )

@@ -193,6 +193,27 @@ def apply_theme():
         .badge-C {{ background-color: {YELLOW}; color:#242A27; }}
         .badge-D {{ background-color: {RED}; }}
         .badge-premium {{ background-color: {GREEN}; }}
+        .grading-result {{
+            padding: 24px;
+            margin-bottom: 24px;
+            background: #F2F6F3;
+            border: 1px solid #D4DED8;
+            border-radius: 12px;
+        }}
+        .grading-result-label {{
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #37413C;
+        }}
+        .grading-result .badge {{
+            font-size: clamp(28px, 4vw, 42px);
+            font-weight: 750;
+            line-height: 1.2;
+            padding: 12px 22px;
+            text-transform: none;
+            letter-spacing: normal;
+        }}
         .badge-grade-1 {{ background-color: #6F8F69; }}
         .badge-grade-2 {{ background-color: {YELLOW}; color:#242A27; }}
         .badge-reject {{ background-color: {RED}; }}

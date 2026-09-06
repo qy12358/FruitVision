@@ -9,10 +9,11 @@ from config import SECONDARY
 from datetime import datetime
 
 from modules.report_generator import (
+    build_report_details,
     format_coverage,
     generate_pdf_report,
-    generate_report_string,
 )
+from modules.quality_grader import QualityGrader, SURFACE_GRADING_RULES, SURFACE_GRADING_HEADERS
 
 from plotly.subplots import make_subplots
 from services.histograms import format_class_label
@@ -72,7 +73,7 @@ def render_rejected_analysis(analysis: dict):
             analysis["image"],
             channels="BGR",
             caption="Submitted photo",
-            use_container_width=True,
+            width="stretch",
         )
 
     with c2:
@@ -80,7 +81,7 @@ def render_rejected_analysis(analysis: dict):
             analysis["result"]["fruit_mask"],
             clamp=True,
             caption="Detected foreground area",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -98,9 +99,10 @@ def render_live_assessment(analysis: dict, batch_id: str):
     statistical_analysis = analysis.get("statistical_analysis", {})
     colour_histogram = analysis.get("colour_histogram", {})
 
-    quality_result = analysis.get("quality_result", {})
+    defect_coverage = blemish_result.get("defect_percentage", analysis.get("defect_pct"))
+    quality_result = QualityGrader().grade_defects(defect_coverage, ripeness)
     defect_types = analysis.get("defect_types", [])
-    grade = analysis.get("grade")
+    grade = quality_result["grade"]
 
     # ============================================================
     # MANGO COUNT
@@ -124,145 +126,97 @@ def render_live_assessment(analysis: dict, batch_id: str):
         )
 
     # ============================================================
-    # RIPENESS RESULT
+    # OVERALL RESULT
     # ============================================================
 
-    if classification_error:
-        st.error(
-            classification_error
+    result_columns = st.columns([1, 1.35], gap="large")
+
+    with result_columns[0]:
+        st.image(
+            analysis["image"],
+            channels="BGR",
+            caption="Uploaded mango photo",
+            width="stretch",
         )
 
-        st.caption(
-            "The image and surface analysis completed, but the ripeness model "
-            "could not produce a result. Check that the trained model files "
-            "are available in the models folder."
-        )
-
-    else:
-        advice = RIPENESS_ADVICE.get(
-            ripeness,
-            "",
-        )
-
-        hero_colour = RIPENESS_COLORS.get(
-            ripeness,
-            PRIMARY,
-        )
-
-        st.markdown(
-            f"""
-            <div class="hero-card" style="--hero-color:{hero_colour};">
-                <div class="hero-title">Predicted ripeness</div>
-                {ripeness_badge(ripeness)}
-                <div class="hero-advice">{advice}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        if confidence < 70.0:
-            st.warning(
-                f"Model confidence is {confidence:.1f}%. "
-                "Consider taking another photo under even lighting "
-                "and checking the mango manually."
-            )
-
-        # ========================================================
-        # MULTIPLE MANGO RESULTS
-        # ========================================================
-
-        object_predictions = analysis.get(
-            "object_predictions",
-            [],
-        )
-
-        if len(object_predictions) > 1:
-            st.markdown(
-                "##### Individual mango results"
-            )
-
-            columns = st.columns(
-                min(
-                    3,
-                    len(object_predictions),
-                )
-            )
-
-            for position, (
-                mango_object,
-                object_result,
-            ) in enumerate(object_predictions):
-
-                label = format_class_label(
-                    object_result["prediction"]
-                )
-
-                with columns[position % len(columns)]:
-                    st.image(
-                        mango_object["processed"]["segmented_rgb"],
-                        caption=f"Mango {position + 1}",
-                        use_container_width=True,
-                    )
-
-                    st.markdown(
-                        f"**{label}** "
-                        f"({float(object_result['confidence']):.1f}% confidence)"
-                    )
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.plotly_chart(
-                confidence_gauge(
-                    confidence,
-                    ripeness,
-                ),
-                use_container_width=True,
-                config={
-                    "displayModeBar": False,
-                },
-            )
-
+    with result_columns[1]:
+        if classification_error:
+            st.error(classification_error)
             st.caption(
-                "Prediction confidence"
+                "The image and surface analysis completed, but the ripeness model "
+                "could not produce a result. Check that the trained model files "
+                "are available in the models folder."
+            )
+        else:
+            advice = RIPENESS_ADVICE.get(ripeness, "")
+            hero_colour = RIPENESS_COLORS.get(ripeness, PRIMARY)
+
+            st.markdown(
+                f"""
+                <div class="hero-card" style="--hero-color:{hero_colour};">
+                    <div class="hero-title">Predicted ripeness</div>
+                    {ripeness_badge(ripeness)}
+                    <div class="hero-advice">{advice}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-        with c2:
-            st.image(
-                result["segmented_rgb"],
-                caption="Mango area analysed by the AI",
-                use_container_width=True,
+            st.plotly_chart(
+                confidence_gauge(confidence, ripeness),
+                width="stretch",
+                config={"displayModeBar": False},
             )
+            st.caption("Prediction confidence")
+
+            if confidence < 70.0:
+                st.warning(
+                    f"Model confidence is {confidence:.1f}%. "
+                    "Consider taking another photo under even lighting "
+                    "and checking the mango manually."
+                )
+
+        summary_columns = st.columns(3)
+        with summary_columns[0]:
+            metric_card("Confidence", f"{confidence:.1f}%")
+        with summary_columns[1]:
+            metric_card("Quality grade", grade or "Unavailable")
+        with summary_columns[2]:
+            metric_card(
+                "Defect coverage",
+                format_coverage(defect_coverage),
+            )
+
+    # ============================================================
+    # MULTIPLE MANGO RESULTS
+    # ============================================================
+
+    object_predictions = analysis.get("object_predictions", [])
+
+    if len(object_predictions) > 1:
+        st.markdown("##### Individual mango results")
+
+        columns = st.columns(min(3, len(object_predictions)))
+
+        for position, (mango_object, object_result) in enumerate(object_predictions):
+            label = format_class_label(object_result["prediction"])
+
+            with columns[position % len(columns)]:
+                st.image(
+                    mango_object["processed"]["segmented_rgb"],
+                    caption=f"Mango {position + 1}",
+                    width="stretch",
+                )
+                st.markdown(
+                    f"**{label}** "
+                    f"({float(object_result['confidence']):.1f}% confidence)"
+                )
 
     # ============================================================
     # REPORT DOWNLOAD
     # ============================================================
 
     st.write("")
-
-    b1, b2 = st.columns(2)
-
-    report_text = generate_report_string(
-        fruit_type=FRUIT_TYPE,
-        batch_id=batch_id,
-        ripeness=ripeness,
-        confidence=confidence,
-        quality_result=quality_result,
-        severity=analysis.get("severity"),
-        defect_types=defect_types,
-    )
-
-    with b1:
-        st.download_button(
-            label="Download report summary",
-            data=report_text,
-            file_name=(
-                f"mango-assessment-"
-                f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
-            ),
-            mime="text/markdown",
-            use_container_width=True,
-        )
 
     # ============================================================
     # PDF REPORT
@@ -279,6 +233,7 @@ def render_live_assessment(analysis: dict, batch_id: str):
             defect_types=defect_types,
             original_image=analysis["image"],
             overlay_image=blemish_result["overlay"],
+            report_details=build_report_details(analysis),
         )
 
         pdf_error = None
@@ -290,23 +245,20 @@ def render_live_assessment(analysis: dict, batch_id: str):
         pdf_report = None
         pdf_error = str(exc)
 
-    with b2:
-        st.download_button(
-            label="Export PDF",
-            data=pdf_report or b"",
-            file_name=(
-                f"mango-assessment-"
-                f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf"
-            ),
-            mime="application/pdf",
-            disabled=pdf_report is None,
-            use_container_width=True,
-        )
+    st.download_button(
+        label="Export PDF",
+        data=pdf_report or b"",
+        file_name=(
+            f"mango-assessment-"
+            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.pdf"
+        ),
+        mime="application/pdf",
+        disabled=pdf_report is None,
+        width="stretch",
+    )
 
-        if pdf_error:
-            st.caption(
-                pdf_error
-            )
+    if pdf_error:
+        st.caption(pdf_error)
 
     saved_id = st.session_state.get(
         "current_saved_id"
@@ -415,14 +367,14 @@ def render_live_assessment(analysis: dict, batch_id: str):
                 analysis["image"],
                 channels="BGR",
                 caption="Original photo",
-                use_container_width=True,
+                width="stretch",
             )
 
             st.image(
                 result["resized"],
                 channels="BGR",
                 caption="Model input",
-                use_container_width=True,
+                width="stretch",
             )
 
         with col2:
@@ -430,27 +382,27 @@ def render_live_assessment(analysis: dict, batch_id: str):
                 result["candidate_mask"],
                 clamp=True,
                 caption="Foreground candidate",
-                use_container_width=True,
+                width="stretch",
             )
 
             st.image(
                 result["leaf_mask"],
                 clamp=True,
                 caption="Removed leaf layer",
-                use_container_width=True,
+                width="stretch",
             )
 
             st.image(
                 result["fruit_mask"],
                 clamp=True,
                 caption="Detected mango area",
-                use_container_width=True,
+                width="stretch",
             )
 
             st.image(
                 result["segmented_rgb"],
                 caption="Background removed",
-                use_container_width=True,
+                width="stretch",
             )
 
         detected = analysis.get(
@@ -548,7 +500,7 @@ def render_live_assessment(analysis: dict, batch_id: str):
 
             st.plotly_chart(
                 probability_fig,
-                use_container_width=True,
+                width="stretch",
             )
 
             # ====================================================
@@ -676,7 +628,7 @@ def render_live_assessment(analysis: dict, batch_id: str):
 
                 st.plotly_chart(
                     histogram_fig,
-                    use_container_width=True,
+                    width="stretch",
                 )
 
                 with st.expander(
@@ -702,13 +654,6 @@ def render_live_assessment(analysis: dict, batch_id: str):
         # --------------------------------------------------------
         # GET ACTUAL CURRENT VALUES
         # --------------------------------------------------------
-
-        defect_coverage = float(
-            analysis.get(
-                "defect_pct",
-                0.0,
-            )
-        )
 
         severity = analysis.get(
             "severity",
@@ -877,7 +822,7 @@ For this assessment, the model detected:
                 analysis["image"],
                 channels="BGR",
                 caption="Original mango",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c2:
@@ -885,7 +830,7 @@ For this assessment, the model detected:
                 blemish_result["overlay"],
                 channels="BGR",
                 caption="Detected defect",
-                use_container_width=True,
+                width="stretch",
             )
 
         # --------------------------------------------------------
@@ -918,55 +863,52 @@ For this assessment, the model detected:
         )
     # ============================================================
     # QUALITY GRADE
-    # UNCHANGED
     # ============================================================
 
     with st.expander(
-        "How the surface quality grade was produced"
+        "How the quality grade was produced",
+        expanded=True,
     ):
-        st.caption(
-            "After surface defects have been measured, "
-            "the quality grading function combines blemish coverage, "
-            "damage coverage and the ripeness result to produce "
-            "the final surface quality grade."
-        )
-
         st.markdown(
-            grade_badge(grade),
+            '<div class="grading-result">'
+            '<div class="grading-result-label">Final quality grade</div>'
+            f'{grade_badge(grade)}'
+            '</div>',
             unsafe_allow_html=True,
         )
 
-        s1, s2, s3 = st.columns(3)
+        st.markdown("**Criteria used for this grade**")
+        s1, s2 = st.columns(2)
 
         s1.metric(
-            "Blemish coverage",
-            format_coverage(
-                quality_result.get(
-                    "blemish_coverage"
-                )
-            ),
+            "Ripeness stage",
+            ripeness or "Unavailable",
         )
 
         s2.metric(
-            "Damage coverage",
+            "Total defect coverage",
             format_coverage(
                 quality_result.get(
-                    "damage_coverage"
+                    "defect_coverage"
                 )
             ),
         )
 
-        s3.metric(
-            "Severity",
-            analysis.get(
-                "severity",
-                "Unavailable",
-            ),
-        )
-
-        st.caption(
+        st.info(
             quality_result.get(
                 "reason",
                 "No grading explanation is available.",
             )
         )
+        st.caption(
+            "The system combines ripeness stage and total defect coverage to assign the grade. "
+            "Rotten mangoes are always rejected. Severity and defect-region count are "
+            "supporting measurements shown in Surface defect analysis."
+        )
+        st.markdown("**Grading rule reference**")
+        st.caption(
+            "The system uses the rules in this table to assign the quality grade "
+            "based on the mango's ripeness stage and total defect coverage."
+        )
+        st.table([dict(zip(SURFACE_GRADING_HEADERS, row))
+                  for row in SURFACE_GRADING_RULES])

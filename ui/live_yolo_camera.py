@@ -233,7 +233,7 @@ def render_live_yolo_camera():
         st.button(
             "🥭 Analyse detected mango",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key=(
                 "analyse_detected_mango"
             ),

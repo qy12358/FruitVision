@@ -9,11 +9,13 @@ import json
 import numpy as np
 import pandas as pd
 import sqlite3
+from contextlib import closing
+from modules.report_generator import serialize_report_details
 
 def initialise_database():
     """Create the local assessment database if it does not already exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(sqlite3.connect(DB_PATH)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS assessments (
@@ -51,6 +53,9 @@ def initialise_database():
             )
             """
         )
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(assessments)')}
+        if 'report_details_json' not in columns:
+            connection.execute('ALTER TABLE assessments ADD COLUMN report_details_json TEXT')
         connection.commit()
 
 def json_default(value):
@@ -129,9 +134,10 @@ def save_assessment(analysis: dict, batch_id: str) -> str:
         sqlite3.Binary(encode_png(blemish_result.get("damage_mask"), "BGR")),
         sqlite3.Binary(encode_png(blemish_result.get("blackhat"), "BGR")),
         sqlite3.Binary(encode_png(result.get("fruit_mask"), "BGR")),
+        serialize_report_details(analysis),
     )
 
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(sqlite3.connect(DB_PATH)) as connection, connection:
         connection.execute(
             """
             INSERT INTO assessments (
@@ -142,8 +148,8 @@ def save_assessment(analysis: dict, batch_id: str) -> str:
                 feature_count, inference_time_ms, preprocessing_time, contrast_method,
                 mango_pixel_count, total_pixel_count, accepted_count, rejected_count,
                 original_image, processed_image, overlay_image, damage_mask,
-                blackhat_image, fruit_mask
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                blackhat_image, fruit_mask, report_details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             values,
         )
@@ -159,7 +165,7 @@ def load_history_dataframe() -> pd.DataFrame:
         FROM assessments
         ORDER BY created_at DESC
     """
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(sqlite3.connect(DB_PATH)) as connection, connection:
         rows = connection.execute(query).fetchall()
 
     columns = [
@@ -180,7 +186,7 @@ def load_history_dataframe() -> pd.DataFrame:
     return history
 
 def fetch_assessment(assessment_id: str) -> dict | None:
-    with sqlite3.connect(DB_PATH) as connection:
+    with closing(sqlite3.connect(DB_PATH)) as connection, connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             "SELECT * FROM assessments WHERE assessment_id = ?",

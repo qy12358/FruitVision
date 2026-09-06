@@ -4,6 +4,7 @@ import time
 
 import cv2
 import numpy as np
+from modules.quality_grader import surface_severity
 
 from services.histograms import (
     format_class_label,
@@ -297,17 +298,8 @@ def combine_object_blemish_results(
     # SEVERITY
     # ============================================================
 
-    if defect_percentage < 1.5:
-
-        severity = "Low"
-
-    elif defect_percentage < 5.0:
-
-        severity = "Medium"
-
-    else:
-
-        severity = "High"
+    defect_percentage = round(defect_percentage, 2)
+    severity = surface_severity(defect_percentage)
 
     # ============================================================
     # OVERLAY
@@ -848,24 +840,11 @@ def perform_assessment(
     # ============================================================
     # QUALITY GRADING
     #
-    # Current defect model:
-    #
-    # blemish coverage = total defect coverage
-    # damage coverage = 0
+    # Grade the total coverage measured by the single-class surface detector.
     # ============================================================
 
     quality_result = (
-        quality_grader.grade(
-            blemish_coverage=(
-                blemish_pct
-            ),
-
-            damage_coverage=(
-                damage_pct
-            ),
-
-            ripeness=ripeness,
-        )
+        quality_grader.grade_defects(defect_pct, ripeness)
     )
 
     grade = (

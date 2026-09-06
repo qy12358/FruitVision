@@ -97,7 +97,7 @@ def render_model_selection_tip():
             },
         ]
     )
-    st.dataframe(comparison_df, hide_index=True, use_container_width=True)
+    st.dataframe(comparison_df, hide_index=True, width="stretch")
 
     st.success(
         "**Why this matters:** ResNet-50 and DenseNet-169 achieve similar ImageNet "
