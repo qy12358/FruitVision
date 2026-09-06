@@ -14,6 +14,7 @@ from services.models import (
     load_blemish_detector,
     load_mango_identifier,
     load_ripeness_classifier,
+    load_yolo_mango_detector,
     model_signature,
     preprocessor,
     quality_grader,
@@ -471,6 +472,67 @@ def combine_object_blemish_results(
 # MAIN ASSESSMENT PIPELINE
 # ================================================================
 
+def verify_rejected_objects(objects, detections):
+    """Use independent, spatially matching mango detections as gate evidence."""
+    verified = []
+    for item in objects:
+        updated = item.copy()
+        if item["is_mango"] or item.get("scene_clutter"):
+            verified.append(updated)
+            continue
+        x, y, width, height = item["bbox"]
+        for detection in detections:
+            if detection["confidence"] < 0.80:
+                continue
+            dx, dy, dw, dh = detection["bbox"]
+            intersection = max(0, min(x + width, dx + dw) - max(x, dx)) * max(
+                0, min(y + height, dy + dh) - max(y, dy)
+            )
+            union = width * height + dw * dh - intersection
+            if union <= 0 or intersection / union < 0.50:
+                continue
+            updated.update(
+                is_mango=True, score=float(detection["confidence"]),
+                method="YOLO mango verification after identity-gate rejection",
+                reason="Accepted by an overlapping high-confidence YOLO mango detection",
+                rejection_reasons=[],
+                original_gate_score=item["score"],
+                original_gate_rejection_reasons=item.get("rejection_reasons", []),
+            )
+            break
+        verified.append(updated)
+    return verified
+
+
+def segment_verified_detections(image, detections):
+    """Recover foreground with GrabCut constrained by strong YOLO boxes."""
+    height, width = image.shape[:2]
+    scale = min(1.0, 640.0 / max(height, width))
+    small = cv2.resize(image, (max(1, round(width * scale)), max(1, round(height * scale))))
+    sh, sw = small.shape[:2]
+    combined = np.zeros((sh, sw), np.uint8)
+    for detection in detections:
+        if detection["confidence"] < 0.80:
+            continue
+        x, y, w, h = detection["bbox"]
+        x1, y1 = max(1, round(x * scale)), max(1, round(y * scale))
+        x2, y2 = min(sw - 1, round((x + w) * scale)), min(sh - 1, round((y + h) * scale))
+        if x2 - x1 < 3 or y2 - y1 < 3:
+            continue
+        mask = np.zeros((sh, sw), np.uint8)
+        try:
+            cv2.setRNGSeed(0)
+            cv2.grabCut(small, mask, (x1, y1, x2 - x1, y2 - y1),
+                        np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64),
+                        5, cv2.GC_INIT_WITH_RECT)
+        except cv2.error:
+            continue
+        foreground = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+        # Do not substitute the bounding rectangle for a failed segmentation.
+        combined = cv2.bitwise_or(combined, foreground)
+    return cv2.resize(combined, (width, height), interpolation=cv2.INTER_NEAREST)
+
+
 def perform_assessment(
     image: np.ndarray,
 ) -> dict:
@@ -521,6 +583,23 @@ def perform_assessment(
             preprocessed=result,
         )
     )
+
+    if not any(item["is_mango"] for item in detected_objects):
+        # Damaged mangoes can fail colour/shape identity heuristics. Only use
+        # the mango-specific detector when the normal gate rejected a scene.
+        try:
+            verifier = load_yolo_mango_detector(model_signature("models/mango_yolo.pt"))
+        except FileNotFoundError:
+            pass  # Optional verification must not disable the original gate.
+        else:
+            detections = verifier.detect(image)
+            if not detected_objects:
+                recovered_mask = segment_verified_detections(image, detections)
+                if cv2.countNonZero(recovered_mask):
+                    result = preprocessor.preprocess(image, mask_override=recovered_mask)
+                    preprocessing_time = time.time() - start
+                    detected_objects = mango_identifier.identify_objects(image, preprocessed=result)
+            detected_objects = verify_rejected_objects(detected_objects, detections)
 
     accepted_objects = [
         item
@@ -739,22 +818,20 @@ def perform_assessment(
         # ========================================================
 
         for mango_object in accepted_objects:
+            # Training letterboxes the complete segmented photo. Tightening
+            # its framing changes the fruit scale seen by EfficientNet.
+            # Preserve that framing for single-object scenes; multi-object
+            # scenes still need isolated crops to classify each fruit.
+            classification_input = (
+                result if len(detected_objects) == 1
+                else mango_object["processed"]
+            )
 
             object_result = (
                 classifier.predict(
-                    mango_object[
-                        "processed"
-                    ][
-                        "segmented"
-                    ],
-
-                    mask=(
-                        mango_object[
-                            "processed"
-                        ][
-                            "mask"
-                        ]
-                    ),
+                    model_segmented_hsv=classification_input["model_segmented_hsv"],
+                    segmented_hsv=classification_input["segmented"],
+                    mask=classification_input["mask"],
                 )
             )
 

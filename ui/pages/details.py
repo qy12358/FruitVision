@@ -10,7 +10,6 @@ from services.histograms import split_histogram_dict
 from services.reports import report_data_from_record
 from services.storage import decode_png
 from services.storage import fetch_assessment
-from ui.report_download import render_pdf_download
 from ui.components import empty_state
 from ui.components import grade_badge
 from ui.components import metric_card
@@ -54,16 +53,27 @@ def render(history_df):
             h2.markdown(f"**Batch ID**  \n{record.get('batch_id') or 'Not specified'}")
             h3.markdown(f"**Date**  \n{created_text}")
 
-            def build_pdf():
-                _, pdf, error = report_data_from_record(record)
-                if error:
-                    raise RuntimeError(error)
-                return pdf
-
-            render_pdf_download(
-                ("saved", selected_id), build_pdf,
-                f"{record['assessment_id']}_report.pdf",
-            )
+            report_text, pdf_report, report_error = report_data_from_record(record)
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    "Download report summary",
+                    data=report_text,
+                    file_name=f"{record['assessment_id']}_report.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            with d2:
+                st.download_button(
+                    "Export PDF",
+                    data=pdf_report or b"",
+                    file_name=f"{record['assessment_id']}_report.pdf",
+                    mime="application/pdf",
+                    disabled=pdf_report is None,
+                    use_container_width=True,
+                )
+                if report_error:
+                    st.caption(report_error)
 
             original = decode_png(record.get("original_image"), cv2.IMREAD_COLOR)
             processed = decode_png(record.get("processed_image"), cv2.IMREAD_COLOR)
@@ -75,30 +85,30 @@ def render(history_df):
             image_tabs = st.tabs(["Original", "Processed mango", "Defect overlay", "Analysis masks"])
             with image_tabs[0]:
                 if original is not None:
-                    st.image(original, channels="BGR", caption="Original saved photo", width="stretch")
+                    st.image(original, channels="BGR", caption="Original saved photo", use_container_width=True)
                 else:
                     st.info("The original image is not available for this record.")
             with image_tabs[1]:
                 if processed is not None:
-                    st.image(processed, channels="BGR", caption="Mango area used for ripeness classification", width="stretch")
+                    st.image(processed, channels="BGR", caption="Mango area used for ripeness classification", use_container_width=True)
                 else:
                     st.info("The processed image is not available for this record.")
             with image_tabs[2]:
                 if overlay is not None:
-                    st.image(overlay, channels="BGR", caption="Saved defect overlay", width="stretch")
+                    st.image(overlay, channels="BGR", caption="Saved defect overlay", use_container_width=True)
                 else:
                     st.info("The defect overlay is not available for this record.")
             with image_tabs[3]:
                 mask_cols = st.columns(3)
                 with mask_cols[0]:
                     if fruit_mask is not None:
-                        st.image(fruit_mask, clamp=True, caption="Mango mask", width="stretch")
+                        st.image(fruit_mask, clamp=True, caption="Mango mask", use_container_width=True)
                 with mask_cols[1]:
                     if damage_mask is not None:
-                        st.image(damage_mask, clamp=True, caption="Damage mask", width="stretch")
+                        st.image(damage_mask, clamp=True, caption="Damage mask", use_container_width=True)
                 with mask_cols[2]:
                     if blackhat is not None:
-                        st.image(blackhat, clamp=True, caption="Black-hat response", width="stretch")
+                        st.image(blackhat, clamp=True, caption="Black-hat response", use_container_width=True)
 
             st.markdown("<div class='section-title'>Saved result</div>", unsafe_allow_html=True)
             r1, r2, r3, r4 = st.columns(4)
@@ -143,7 +153,7 @@ def render(history_df):
                         )
                     )
                     probability_fig.update_layout(yaxis_title="Probability (%)", yaxis_range=[0, 100], height=280)
-                    st.plotly_chart(probability_fig, width="stretch")
+                    st.plotly_chart(probability_fig, use_container_width=True)
                 else:
                     st.info("Class probabilities were not stored for this assessment.")
 
@@ -159,7 +169,7 @@ def render(history_df):
                     hist_fig.add_trace(go.Bar(x=list(range(16)), y=s_vals, marker_color=SECONDARY), row=1, col=2)
                     hist_fig.add_trace(go.Bar(x=list(range(16)), y=v_vals, marker_color=PRIMARY_LIGHT), row=1, col=3)
                     hist_fig.update_layout(height=300, showlegend=False, margin=dict(t=50, b=20))
-                    st.plotly_chart(hist_fig, width="stretch")
+                    st.plotly_chart(hist_fig, use_container_width=True)
                     render_hsv_histogram_tips(record.get("ripeness") or "Unavailable", h_vals, s_vals, v_vals)
 
             with st.expander("Quality grading details"):

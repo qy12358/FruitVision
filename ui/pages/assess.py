@@ -1,6 +1,7 @@
 """ui / pages / assess for ManGo or Stay."""
 
 from services.assessment import perform_assessment
+from services.image_input import decode_uploaded_image
 from services.storage import save_assessment
 
 from ui.assessment_results import (
@@ -20,7 +21,6 @@ from ui.live_yolo_camera import (
 
 import cv2
 import hashlib
-import numpy as np
 import sqlite3
 import streamlit as st
 
@@ -188,15 +188,7 @@ def render(history_df):
 
         source_bytes = uploaded.getvalue()
 
-        file_array = np.frombuffer(
-            source_bytes,
-            dtype=np.uint8,
-        )
-
-        image = cv2.imdecode(
-            file_array,
-            cv2.IMREAD_COLOR,
-        )
+        image = decode_uploaded_image(source_bytes)
 
         source_type = "upload"
 
@@ -223,15 +215,7 @@ def render(history_df):
 
         source_bytes = use_camera.getvalue()
 
-        file_array = np.frombuffer(
-            source_bytes,
-            dtype=np.uint8,
-        )
-
-        image = cv2.imdecode(
-            file_array,
-            cv2.IMREAD_COLOR,
-        )
+        image = decode_uploaded_image(source_bytes)
 
         source_type = "camera"
 

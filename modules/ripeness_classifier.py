@@ -874,6 +874,7 @@ class HybridRipenessClassifier:
     def prepare_image_branch(
         self,
         segmented_hsv: np.ndarray,
+        model_segmented_hsv: np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Prepare Module 1's segmented HSV image for EfficientNetB0.
@@ -897,14 +898,24 @@ class HybridRipenessClassifier:
         Keras EfficientNetB0 performs its own input rescaling.
         """
 
-        height, width = segmented_hsv.shape[:2]
+        if model_segmented_hsv is not None:
+            expected = (self.input_size[1], self.input_size[0], 3)
+            if model_segmented_hsv.shape != expected:
+                raise ValueError(f"Model HSV image must have shape {expected}.")
+            rgb = cv2.cvtColor(model_segmented_hsv, cv2.COLOR_HSV2RGB)
+            return np.expand_dims(rgb.astype(np.float32), axis=0)
+
+        # Legacy callers only supply native HSV. Resize in BGR, as Module 1
+        # does during training; interpolating hue directly changes colours.
+        segmented_bgr = cv2.cvtColor(segmented_hsv, cv2.COLOR_HSV2BGR)
+        height, width = segmented_bgr.shape[:2]
         target_width, target_height = self.input_size
         scale = min(target_width / width, target_height / height)
         new_width = max(1, int(round(width * scale)))
         new_height = max(1, int(round(height * scale)))
         interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
         resized = cv2.resize(
-            segmented_hsv,
+            segmented_bgr,
             (new_width, new_height),
             interpolation=interpolation,
         )
@@ -922,7 +933,8 @@ class HybridRipenessClassifier:
         # HSV channels converted to an RGB-shaped tensor.  Keep it stable so
         # a source-level preprocessing refactor does not silently invalidate
         # the saved ripeness weights.
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_HSV2RGB)
+        model_hsv = cv2.cvtColor(canvas, cv2.COLOR_BGR2HSV)
+        rgb = cv2.cvtColor(model_hsv, cv2.COLOR_HSV2RGB)
 
         normalized = rgb.astype(
             np.float32
@@ -1005,6 +1017,7 @@ class HybridRipenessClassifier:
         self,
         segmented_hsv: np.ndarray,
         mask: np.ndarray | None = None,
+        model_segmented_hsv: np.ndarray | None = None,
     ) -> dict:
         """
         Run hybrid ripeness prediction.
@@ -1015,6 +1028,9 @@ class HybridRipenessClassifier:
 
             mask:
                 The mango segmentation mask from Module 1.
+
+            model_segmented_hsv:
+                Module 1's model-sized HSV output, matching the training input.
 
         Returns:
             Dictionary containing:
@@ -1035,7 +1051,8 @@ class HybridRipenessClassifier:
 
         image_input = (
             self.prepare_image_branch(
-                segmented_hsv
+                segmented_hsv,
+                model_segmented_hsv=model_segmented_hsv,
             )
         )
 
