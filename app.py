@@ -21,10 +21,14 @@ from modules.mango_identifier import MangoIdentifier
 from modules.ripeness_classifier import HybridRipenessClassifier
 from modules.blemish_detector import BlemishDetector
 from modules.quality_grader import QualityGrader
+from modules.assessment_store import (
+    load_assessment,
+    load_assessments,
+    save_assessment,
+)
 from modules.report_generator import (
     format_coverage,
     generate_pdf_report,
-    generate_report_string,
 )
 
 preprocessor = ImagePreprocessor()
@@ -41,7 +45,7 @@ def model_signature(path: str) -> int:
 
 @st.cache_resource
 def load_mango_identifier(signature: int = 0) -> MangoIdentifier:
-    """Load the optional binary mango gate once per Streamlit process."""
+    """Load the trained CNN mango gate once per Streamlit process."""
     return MangoIdentifier(
         model_path="models/mango_identifier.keras",
     )
@@ -312,7 +316,7 @@ RIPENESS_ADVICE = {
 FRUITS = ["Mango"]
 
 RIPENESS_LEVELS = ["Ripe", "Rotten", "Semi-Ripe", "Unripe"]
-GRADES = ["A", "B", "C", "D"]
+GRADES = ["Premium", "Grade 1", "Grade 2", "Reject"]
 DEFECT_TYPES = ["Bruise", "Scratch", "Rot", "Pest Damage"]
 SEVERITY = ["Low", "Medium", "High"]
 
@@ -352,6 +356,17 @@ def generate_history(n=150):
 
 
 history_df = generate_history()
+try:
+    persisted_assessments = load_assessments()
+except (OSError, ValueError):
+    # The app can still open its dashboard if a local database is temporarily
+    # unavailable; new assessments will show an explicit save error below.
+    persisted_assessments = []
+if persisted_assessments:
+    # Once real assessments exist, history should represent saved application
+    # data only; the generated rows are used solely as an empty-state demo.
+    history_df = pd.DataFrame(persisted_assessments)
+persisted_assessment_ids = {item["ID"] for item in persisted_assessments}
 
 # ------------------------------------------------------------------
 # SIDEBAR NAVIGATION
@@ -374,7 +389,7 @@ with st.sidebar:
     if page != "New Assessment":
         if st.button("➕ New Assessment", use_container_width=True, type="primary"):
             go_to("New Assessment")
-    st.caption(f"📌 {len(st.session_state.saved_assessments)} assessment(s) saved this session")
+    st.caption(f"📌 {len(persisted_assessments)} assessment(s) saved to database")
 
 # ------------------------------------------------------------------
 # HELPERS
@@ -470,6 +485,39 @@ def empty_state(icon: str, title: str, subtitle: str):
         """,
         unsafe_allow_html=True,
     )
+
+
+def history_json_safe(value):
+    """Make stored analysis data readable in Streamlit's JSON viewer."""
+
+    if isinstance(value, np.ndarray):
+        return {
+            "stored_image_array": True,
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+        }
+    if isinstance(value, dict):
+        return {str(key): history_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [history_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def stored_image_items(value, path="analysis"):
+    """Yield every stored 2-D/3-D image array for the history viewer."""
+
+    if isinstance(value, np.ndarray):
+        if value.ndim in (2, 3) and value.size:
+            yield path, value
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from stored_image_items(item, f"{path} / {key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from stored_image_items(item, f"{path} / {index}")
 
 
 def combine_object_blemish_results(image, objects, analyses):
@@ -575,6 +623,36 @@ def combine_object_blemish_results(image, objects, analyses):
     }
 
 
+def apply_rotten_safety_override(ripeness_result, blemish_result):
+    """Prevent severe visible deterioration from being shown as edible.
+
+    The ripeness CNN can confuse a very damaged green/yellow mango with ripe
+    fruit because the rotten class is small.  This is intentionally a high
+    bar: only substantial severe-damage coverage or a high overall defect
+    result changes the class, and the UI records that the safety rule—not the
+    CNN probability—made the final decision.
+    """
+    damage_percentage = float(blemish_result.get("damage_percentage", 0.0) or 0.0)
+    defect_percentage = float(blemish_result.get("defect_percentage", 0.0) or 0.0)
+    severe_damage = (
+        damage_percentage >= 5.0
+        or defect_percentage >= 12.0
+        or blemish_result.get("severity") == "High"
+    )
+    if not severe_damage or ripeness_result.get("prediction") == "rotten":
+        return ripeness_result
+
+    overridden = dict(ripeness_result)
+    overridden["prediction"] = "rotten"
+    overridden["confidence"] = 100.0
+    overridden["probabilities"] = {
+        class_name: (100.0 if class_name == "rotten" else 0.0)
+        for class_name in ripeness_result.get("probabilities", {})
+    }
+    overridden["decision_source"] = "severe-damage safety override"
+    return overridden
+
+
 # ------------------------------------------------------------------
 # PAGE 1: DASHBOARD
 # ------------------------------------------------------------------
@@ -604,9 +682,9 @@ if page == "Dashboard":
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         st.markdown("</div>", unsafe_allow_html=True)
     with c3:
-        grade_a_pct = round((history_df["Grade"] == "A").mean() * 100, 1)
-        metric_card("Quality Grade A %", f"{grade_a_pct}%")
-        st.progress(grade_a_pct / 100)
+        premium_pct = round((history_df["Grade"] == "Premium").mean() * 100, 1)
+        metric_card("Premium Grade %", f"{premium_pct}%")
+        st.progress(premium_pct / 100)
     with c4:
         defect_rate = round((history_df["Defect %"] > 5).mean() * 100, 1)
         metric_card("Defect Detection Rate", f"{defect_rate}%")
@@ -746,7 +824,7 @@ elif page == "New Assessment":
             image,
             preprocessed=result,
         )
-        accepted_objects = [
+        accepted_candidates = [
             item for item in detected_objects if item["is_mango"]
         ]
         rejected_objects = [
@@ -760,8 +838,24 @@ elif page == "New Assessment":
             detected_objects[0]["method"]
             if detected_objects else "HSV + contour fallback"
         )
-        if not accepted_objects:
-            st.error("Rejected: this image does not contain a clear mango.")
+        if not accepted_candidates:
+            identity_model_unavailable = any(
+                item.get("method") == "identity CNN unavailable - fail closed"
+                for item in detected_objects
+            )
+            if identity_model_unavailable:
+                st.error(
+                    "Mango identification is unavailable, so this image was "
+                    "rejected safely. Install/enable the trained CNN runtime "
+                    "before analysing user images."
+                )
+            elif use_camera:
+                st.error(
+                    "No clear mango was detected. Please retake the photo "
+                    "with one mango fully visible and in focus."
+                )
+            else:
+                st.error("Rejected: this image does not contain a clear mango.")
             st.caption(
                 f"Mango gate score: {best_gate_score * 100:.1f}% "
                 f"({gate_method}). Ripeness analysis was not run."
@@ -791,9 +885,42 @@ elif page == "New Assessment":
                 )
             st.stop()
 
+        # A live camera image must be unambiguous. For an uploaded multi-mango
+        # photo, keep only the largest foreground mango for ripeness analysis.
+        if use_camera and (
+            len(detected_objects) != 1
+            or len(accepted_candidates) != 1
+        ):
+            st.warning(
+                "For accurate live-camera analysis, please take a new photo "
+                "containing exactly one clear mango."
+            )
+            st.caption(
+                f"The camera view contains {len(detected_objects)} detected "
+                "foreground object(s). Ripeness analysis was not run."
+            )
+            st.image(image, channels="BGR", caption="Camera photo to retake")
+            st.stop()
+
+        ignored_mango_count = max(0, len(accepted_candidates) - 1)
+        if ignored_mango_count:
+            accepted_objects = [
+                max(
+                    accepted_candidates,
+                    key=lambda item: item.get("foreground_area", 0),
+                )
+            ]
+        else:
+            accepted_objects = accepted_candidates
+
         st.info(
             f"Detected {len(accepted_objects)} mango object(s) in the image."
         )
+        if ignored_mango_count:
+            st.warning(
+                "Multiple mangoes were detected. Only the most prominent "
+                "mango is being analyzed."
+            )
         if rejected_objects:
             st.warning(
                 f"Detected {len(accepted_objects)} mango(s). "
@@ -843,6 +970,8 @@ elif page == "New Assessment":
         feature_count = 0
         inference_time_ms = 0.0
         object_predictions = []
+        decision_source = None
+        ripeness_result = None
 
         try:
             classifier = load_ripeness_classifier(
@@ -861,7 +990,12 @@ elif page == "New Assessment":
 
             # Keep the existing single-object UI variables for the report and
             # gauge.  The individual results are rendered below as well.
-            ripeness_result = object_predictions[0][1]
+            first_mango_object, first_prediction = object_predictions[0]
+            ripeness_result = apply_rotten_safety_override(
+                first_prediction,
+                blemish_result,
+            )
+            object_predictions[0] = (first_mango_object, ripeness_result)
 
             raw_prediction = ripeness_result["prediction"]
             prediction = format_class_label(raw_prediction)
@@ -872,6 +1006,7 @@ elif page == "New Assessment":
             colour_histogram = ripeness_result["colour_histogram"]
             feature_count = ripeness_result["feature_count"]
             inference_time_ms = ripeness_result["inference_time_ms"]
+            decision_source = ripeness_result.get("decision_source")
 
             ripeness = prediction
             raw_ripeness = raw_prediction
@@ -882,6 +1017,84 @@ elif page == "New Assessment":
             ripeness=ripeness,
         )
         grade = quality_result["grade"]
+
+        # Persist every completed analysis as structured data.  The PDF is a
+        # separate on-demand download and is never written into this folder.
+        assessment_id = f"FR-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        analysis_data = {
+            "input": {
+                "fruit_type": fruit_type,
+                "batch_id": batch_id,
+                "source": "camera" if use_camera else "uploaded file",
+                "filename": (
+                    uploaded.name
+                    if uploaded is not None
+                    else "camera_capture"
+                ),
+            },
+            "timings": {
+                "preprocessing_seconds": round(preprocessing_time, 4),
+                "inference_milliseconds": round(inference_time_ms, 2),
+            },
+            "mango_gate": {
+                "detected_objects": detected_objects,
+                "accepted_object_count": len(accepted_candidates),
+                "analysed_object_count": len(accepted_objects),
+                "ignored_mango_count": ignored_mango_count,
+                "rejected_object_count": len(rejected_objects),
+                "best_gate_score": best_gate_score,
+                "method": gate_method,
+            },
+            "preprocessing": result,
+            "blemish_analysis": blemish_result,
+            "ripeness_analysis": ripeness_result,
+            "object_predictions": object_predictions,
+            "quality_grading": quality_result,
+            "images": {
+                "original": image,
+                "segmented_rgb": result.get("segmented_rgb"),
+                "defect_overlay": blemish_result.get("overlay"),
+                "damage_mask": blemish_result.get("damage_mask"),
+                "blemish_mask": blemish_result.get("blemish_mask"),
+            },
+        }
+        saved_record = {
+            "ID": assessment_id,
+            "Fruit Type": fruit_type,
+            "Batch ID": batch_id,
+            "Ripeness": ripeness or "Unavailable",
+            "Confidence": round(float(confidence), 2),
+            "Blemish %": blemish_pct,
+            "Damage %": damage_pct,
+            "Defect %": defect_pct,
+            "Grade": grade,
+            "Interpretation": quality_result.get(
+                "interpretation", quality_result.get("reason", "")
+            ),
+            "Severity": severity,
+            "Defect Types": defect_types,
+            "Decision Source": decision_source or "quality grading rules",
+            "Date": datetime.now(),
+            "Analysis Data": analysis_data,
+        }
+        try:
+            save_assessment(saved_record)
+            st.session_state.saved_assessments.append(
+                {
+                    key: value
+                    for key, value in saved_record.items()
+                    if key != "Analysis Data"
+                }
+            )
+            st.success(
+                f"Analysis saved automatically as {assessment_id}. "
+                "Open History / Reports to review it."
+            )
+        except (OSError, ValueError):
+            st.error(
+                "The analysis completed, but it could not be saved to the "
+                "local assessment database."
+            )
 
         if classification_error:
             st.error(classification_error)
@@ -910,6 +1123,12 @@ elif page == "New Assessment":
                     f"Low model confidence ({confidence:.1f}%). "
                     "Please retake the photo under even lighting or review "
                     "the mango manually."
+                )
+
+            if decision_source:
+                st.warning(
+                    "Classified as Rotten by the severe-damage safety override. "
+                    "Visible deterioration takes priority over the ripeness CNN."
                 )
 
             if len(object_predictions) > 1:
@@ -947,12 +1166,11 @@ elif page == "New Assessment":
                 st.image(result["segmented_rgb"], caption="What the AI focused on")
 
         # ==========================================================
-        # === ACTIONS (SAVE / REPORT) ===
+        # === ACTION (PDF EXPORT) =================================
         # ==========================================================
         st.write("")
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            report_text = generate_report_string(
+        try:
+            pdf_report = generate_pdf_report(
                 fruit_type=fruit_type,
                 batch_id=batch_id,
                 ripeness=ripeness,
@@ -960,52 +1178,20 @@ elif page == "New Assessment":
                 quality_result=quality_result,
                 severity=severity,
                 defect_types=defect_types,
+                original_image=image,
+                overlay_image=blemish_result["overlay"],
             )
-            st.download_button(
-                label="📄 Generate Report",
-                data=report_text,
-                file_name=f"FR-{datetime.now().strftime('%Y%m%d%H%M%S')}_report.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-        with b2:
-            try:
-                pdf_report = generate_pdf_report(
-                    fruit_type=fruit_type,
-                    batch_id=batch_id,
-                    ripeness=ripeness,
-                    confidence=confidence,
-                    quality_result=quality_result,
-                    severity=severity,
-                    defect_types=defect_types,
-                    original_image=image,
-                    overlay_image=blemish_result["overlay"],
-                )
-            except RuntimeError as exc:
-                pdf_report = None
-                st.warning(str(exc))
-            st.download_button(
-                label="Export PDF",
-                data=pdf_report or b"",
-                file_name=f"FR-{datetime.now().strftime('%Y%m%d%H%M%S')}_report.pdf",
-                mime="application/pdf",
-                disabled=pdf_report is None,
-                use_container_width=True,
-            )
-        with b3:
-            if st.button("Save to History", use_container_width=True):
-                new_id = f"FR-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                st.session_state.saved_assessments.append(
-                    {
-                        "ID": new_id,
-                        "Fruit Type": fruit_type,
-                        "Ripeness": ripeness,
-                        "Grade": grade,
-                        "Defect %": defect_pct,
-                        "Date": datetime.now(),
-                    }
-                )
-                st.success(f"Saved as {new_id} — view it in History / Reports.")
+        except RuntimeError as exc:
+            pdf_report = None
+            st.warning(str(exc))
+        st.download_button(
+            label="📄 Save as PDF",
+            data=pdf_report or b"",
+            file_name=f"{assessment_id}_report.pdf",
+            mime="application/pdf",
+            disabled=pdf_report is None,
+            use_container_width=True,
+        )
 
         # ---- TECHNICAL DETAILS (collapsed by default) --------
         st.write("")
@@ -1145,6 +1331,10 @@ elif page == "New Assessment":
                 "Ready" if quality_result.get("available") else "Unavailable",
             )
             st.caption(quality_result.get("reason", "Grading unavailable."))
+            if quality_result.get("interpretation"):
+                st.info(
+                    f"Rule interpretation: {quality_result['interpretation']}"
+                )
 
         # ==========================================================
         # === CLEAN BLEMISH & DAMAGE DETECTION UI (DROPDOWN STYLE) ===
@@ -1196,47 +1386,82 @@ elif page == "Assessment Details":
     st.markdown("<div class='section-title'>Assessment Details</div>", unsafe_allow_html=True)
     selected_id = st.selectbox("Select Assessment", history_df["ID"].head(30))
     row = history_df[history_df["ID"] == selected_id].iloc[0]
+    stored_record = (
+        load_assessment(selected_id)
+        if selected_id in persisted_assessment_ids
+        else None
+    )
 
     top1, top2, top3 = st.columns([2, 2, 2])
     top1.markdown(f"**Assessment ID:** {row['ID']}")
     top2.markdown(f"**Date:** {row['Date'].strftime('%Y-%m-%d %H:%M')}")
-    with top3:
-        st.button("⬇ Export PDF")
+    top3.caption(
+        "Stored assessment" if stored_record else "Sample history record"
+    )
 
     left, right = st.columns([6, 4])
 
     with left:
-        tabs = st.tabs(["Original", "Processed", "Defect Overlay"])
-        with tabs[0]:
-            st.image("https://placehold.co/500x400/4CAF50/FFFFFF?text=Original+Image", use_container_width=True)
-        with tabs[1]:
-            st.image("https://placehold.co/500x400/2E7D32/FFFFFF?text=Processed+Image", use_container_width=True)
-        with tabs[2]:
-            st.image("https://placehold.co/500x400/F44336/FFFFFF?text=Defect+Heatmap", use_container_width=True)
+        if stored_record:
+            data = stored_record.get("Analysis Data", {})
+            images = data.get("images", {})
+            tabs = st.tabs(["Original", "Processed", "Defect Overlay", "All Stored Images"])
+            with tabs[0]:
+                if images.get("original") is not None:
+                    st.image(images["original"], channels="BGR", use_container_width=True)
+            with tabs[1]:
+                if images.get("segmented_rgb") is not None:
+                    st.image(images["segmented_rgb"], channels="RGB", use_container_width=True)
+            with tabs[2]:
+                if images.get("defect_overlay") is not None:
+                    st.image(images["defect_overlay"], channels="BGR", use_container_width=True)
+            with tabs[3]:
+                shown = 0
+                for image_name, stored_image in stored_image_items(data):
+                    st.markdown(f"**{image_name}**")
+                    st.image(stored_image, clamp=True, use_container_width=True)
+                    shown += 1
+                if not shown:
+                    st.info("No stored image artifacts were found for this record.")
+        else:
+            tabs = st.tabs(["Original", "Processed", "Defect Overlay"])
+            with tabs[0]:
+                st.image("https://placehold.co/500x400/4CAF50/FFFFFF?text=Sample+History+Image", use_container_width=True)
+            with tabs[1]:
+                st.image("https://placehold.co/500x400/2E7D32/FFFFFF?text=Sample+Processed+Image", use_container_width=True)
+            with tabs[2]:
+                st.image("https://placehold.co/500x400/F44336/FFFFFF?text=Sample+Defect+Overlay", use_container_width=True)
 
     with right:
         st.markdown("#### Summary")
         st.write(f"**Fruit Type:** {row['Fruit Type']}")
         st.markdown(f"**Ripeness Level:** {ripeness_badge(row['Ripeness'])}", unsafe_allow_html=True)
         st.markdown(f"**Quality Grade:** {grade_badge(row['Grade'])}", unsafe_allow_html=True)
-        overall_score = round(100 - row["Defect %"] * 2 + random.uniform(-3, 3), 1)
+        defect_percent = float(row["Defect %"] or 0)
+        overall_score = round(100 - defect_percent * 2, 1)
         st.metric("Overall Score", f"{overall_score}/100")
-        recommendation = "✅ Ready for Packaging" if row["Defect %"] < 6 else "⚠ Needs Sorting"
+        recommendation = "✅ Ready for Packaging" if defect_percent < 6 else "⚠ Needs Sorting"
         st.write(f"**Recommendation:** {recommendation}")
 
-        st.markdown("#### Detailed Metrics")
-        with st.expander("Preprocessing"):
-            st.write("Resolution: 224x224 · CLAHE enhancement ✓ · Mango segmented ✓")
-        with st.expander("Ripeness"):
+        if stored_record:
+            st.markdown("#### Stored Analysis Metrics")
+            metric_1, metric_2, metric_3 = st.columns(3)
+            metric_1.metric("Blemish Coverage", f"{stored_record['Blemish %']:.2f}%")
+            metric_2.metric("Damage Coverage", f"{stored_record['Damage %']:.2f}%")
+            metric_3.metric("Confidence", f"{stored_record['Confidence']:.1f}%")
+            st.write(f"**Severity:** {stored_record['Severity'] or 'N/A'}")
             st.write(
-                f"Predicted class: {row['Ripeness']} · "
-                f"Model: EfficientNetB0 + 63-Feature Fusion (Hybrid) · "
-                f"Confidence: {round(random.uniform(70,99),1)}%"
+                f"**Defect Types:** "
+                f"{', '.join(stored_record['Defect Types']) or 'None'}"
             )
-        with st.expander("Quality (preview)"):
-            st.write(f"Shape score: {round(random.uniform(0.5,0.99),2)} · Surface defects: {row['Defect %']}%")
-        with st.expander("Blemish (preview)"):
-            st.write(f"Area affected: {row['Defect %']}% · Types: {', '.join(random.sample(DEFECT_TYPES, k=2))}")
+            st.info(
+                f"**Interpretation:** {stored_record['Interpretation'] or 'N/A'}"
+            )
+            with st.expander("All stored analysis data", expanded=False):
+                st.json(history_json_safe(stored_record.get("Analysis Data", {})))
+        else:
+            st.markdown("#### Detailed Metrics")
+            st.caption("This is generated sample history; only completed app analyses contain stored images and full data.")
 
 # ------------------------------------------------------------------
 # PAGE 4: HISTORY / REPORTS
@@ -1259,12 +1484,59 @@ elif page == "History / Reports":
         )
         st.write("")
 
+    if persisted_assessments:
+        st.markdown("##### Stored assessment viewer")
+        stored_ids = [item["ID"] for item in persisted_assessments]
+        history_selected_id = st.selectbox(
+            "Select a saved assessment to display",
+            stored_ids,
+            key="history_selected_assessment_id",
+        )
+        history_record = load_assessment(history_selected_id)
+        if history_record:
+            history_data = history_record.get("Analysis Data", {})
+            history_images = history_data.get("images", {})
+            image_columns = st.columns(3)
+            with image_columns[0]:
+                if history_images.get("original") is not None:
+                    st.image(
+                        history_images["original"],
+                        channels="BGR",
+                        caption="Stored original image",
+                        use_container_width=True,
+                    )
+            with image_columns[1]:
+                if history_images.get("segmented_rgb") is not None:
+                    st.image(
+                        history_images["segmented_rgb"],
+                        channels="RGB",
+                        caption="Stored segmented image",
+                        use_container_width=True,
+                    )
+            with image_columns[2]:
+                if history_images.get("defect_overlay") is not None:
+                    st.image(
+                        history_images["defect_overlay"],
+                        channels="BGR",
+                        caption="Stored defect overlay",
+                        use_container_width=True,
+                    )
+            st.write(
+                f"**{history_record['ID']}** · "
+                f"{history_record['Ripeness']} · "
+                f"{history_record['Grade']} · "
+                f"{history_record['Interpretation']}"
+            )
+            with st.expander("View complete stored analysis data"):
+                st.json(history_json_safe(history_data))
+        st.write("")
+
     st.markdown("##### All assessments")
     s1, s2, s3, s4 = st.columns(4)
     search = s1.text_input("🔍 Search by ID / Type")
     fruit_filter = s2.multiselect("Filter Fruit", FRUITS, default=FRUITS)
     date_range = s3.date_input("Date Range", [])
-    s4.button("⬇ Export All", use_container_width=True)
+    s4.caption("Completed analyses are saved automatically.")
 
     filtered = history_df[history_df["Fruit Type"].isin(fruit_filter)]
     if search:
@@ -1366,13 +1638,30 @@ elif page == "Settings":
             "and statistical features are learned numerical inputs to that model, not "
             "manual thresholds."
         )
-        st.write("**Quality Grading Thresholds**")
-        st.slider("Grade A minimum score", 0, 100, 90)
-        st.slider("Grade B minimum score", 0, 100, 75)
-        st.slider("Grade C minimum score", 0, 100, 60)
-        st.write("**Defect Thresholds**")
-        st.slider("Defect Warning Threshold (%)", 0, 100, 8)
-        st.slider("Auto-Reject Threshold (%)", 0, 100, 20)
+        st.write("**Quality Grading Rules**")
+        st.caption(
+            "The final grade uses the supplied ripeness, blemish coverage, and "
+            "damage coverage table. Boundaries are inclusive at 5% and 10%."
+        )
+        rules_df = pd.DataFrame(QualityGrader.RULES).rename(
+            columns={
+                "ripeness": "Ripeness",
+                "blemish": "Blemish Coverage",
+                "damage": "Damage Coverage",
+                "grade": "Final Grade",
+                "interpretation": "Interpretation",
+            }
+        )
+        rules_df["Ripeness"] = rules_df["Ripeness"].replace(
+            {
+                "semi_ripe": "Semi-Ripe",
+                "ripe": "Ripe",
+                "unripe": "Unripe",
+                "rotten": "Rotten",
+                "any": "Any",
+            }
+        )
+        st.dataframe(rules_df, hide_index=True, use_container_width=True)
 
     st.write("")
     if st.button("💾 Save Settings", type="primary"):

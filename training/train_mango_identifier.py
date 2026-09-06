@@ -1,163 +1,103 @@
-"""Train the binary mango/non-mango identity gate.
+"""Train the MobileNetV2 CNN mango/non-mango identity gate.
 
-Positive examples come from the prepared Harumanis dataset.  Negative
-examples are sampled from Fruit-360's other object classes.  This model is
-intentionally separate from ripeness: a four-class ripeness softmax cannot
-reject a non-mango image because it must always choose one of its four
-classes.
-
-Run from the project root:
-
-    python training/train_mango_identifier.py
+Only repository dataset images are used. External user images remain
+inference-only references and are never copied into a split.
 """
 
+import hashlib
+import json
 import random
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.utils import Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from modules.preprocessing import ImagePreprocessor
+from modules.mango_identifier import fast_identity_processed
 
-POSITIVE_DIR = (
-    PROJECT_ROOT
-    / "dataset"
-    / "mango_harumanis"
-    / "harumanis_phases_V2"
-    / "images"
-)
-NEGATIVE_ROOTS = [
+POSITIVE_ROOTS = [
+    PROJECT_ROOT / "dataset" / "mango_harumanis" / "harumanis_phases_V2" / "images",
+    PROJECT_ROOT / "dataset" / "mango_harumanis" / "harumanis_phases_V2 augmented",
+]
+FRUITS360_ROOTS = [
     PROJECT_ROOT / "dataset" / "fruits360-original" / "Training",
     PROJECT_ROOT / "dataset" / "fruits360-original" / "Test",
 ]
-MULTI_SCENE_ROOT = (
-    PROJECT_ROOT
-    / "dataset"
-    / "fruits360-multi"
-    / "test-multiple_fruits"
-)
-EXTRA_EXAMPLE_ROOT = (
-    PROJECT_ROOT
-    / "dataset"
-    / "mango_gate_examples"
-)
+MULTI_SCENE_ROOT = PROJECT_ROOT / "dataset" / "fruits360-multi" / "test-multiple_fruits"
 MODEL_PATH = PROJECT_ROOT / "models" / "mango_identifier.keras"
+METADATA_PATH = PROJECT_ROOT / "models" / "mango_identifier_metadata.json"
 
 SEED = 42
 IMAGE_SIZE = (224, 224)
-BATCH_SIZE = 32
-NEGATIVES_PER_CLASS = 8
-HARD_NEGATIVE_PER_CLASS = 32
-MULTI_SCENE_NEGATIVE_LIMIT = 256
-HARD_NEGATIVE_TERMS = (
-    "orange",
-    "lemon",
-    "lime",
-    "apple",
-    "peach",
-    "nectarine",
-    "papaya",
-)
-
+# Keep more examples for visually confusing non-mango fruit. In particular,
+# papaya is an important hard negative because its green/oval appearance can
+# otherwise be mistaken for mango by a binary gate.
+MAX_NEGATIVES_PER_CLASS = 64
+HARD_NEGATIVE_LIMITS = {
+    "papaya": 256,
+    "papaya 2": 256,
+    "cactus fruit green 1": 128,
+    "cactus fruit red 1": 128,
+}
+MULTI_SCENE_NEGATIVE_LIMIT = 512
+OPERATING_THRESHOLD = 0.85
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
-def letterbox(image: np.ndarray, target_size=IMAGE_SIZE) -> np.ndarray:
-    """Resize without stretching the object."""
-    target_w, target_h = target_size
-    height, width = image.shape[:2]
-    scale = min(target_w / width, target_h / height)
-    new_size = (
-        max(1, int(round(width * scale))),
-        max(1, int(round(height * scale))),
-    )
-    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-    resized = cv2.resize(image, new_size, interpolation=interpolation)
-    canvas = np.zeros((target_h, target_w, 3), dtype=image.dtype)
-    x = (target_w - new_size[0]) // 2
-    y = (target_h - new_size[1]) // 2
-    canvas[y:y + new_size[1], x:x + new_size[0]] = resized
-    return canvas
-
-
 def collect_examples() -> list[tuple[str, int]]:
+    """Collect deduplicated mango positives and many hard negatives."""
     examples = []
-    for path in POSITIVE_DIR.rglob("*"):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
-            examples.append((str(path), 1))
-
+    positive_by_hash = {}
+    for root in POSITIVE_ROOTS:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                digest = hashlib.sha1(path.read_bytes()).hexdigest()
+                positive_by_hash.setdefault(digest, path.resolve())
+    examples.extend((str(path), 1) for path in sorted(positive_by_hash.values()))
     rng = random.Random(SEED)
-    for root in NEGATIVE_ROOTS:
+    negative_classes = {}
+    for root in FRUITS360_ROOTS:
         if not root.exists():
             continue
         for class_dir in sorted(path for path in root.iterdir() if path.is_dir()):
-            paths = [
-                path for path in sorted(class_dir.rglob("*"))
+            if "mango" in class_dir.name.lower():
+                continue
+            key = class_dir.name.casefold()
+            negative_classes.setdefault(key, []).extend(
+                path for path in class_dir.rglob("*")
                 if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-            ]
-            rng.shuffle(paths)
-            class_name = class_dir.name.lower()
-            limit = (
-                HARD_NEGATIVE_PER_CLASS
-                if any(term in class_name for term in HARD_NEGATIVE_TERMS)
-                else NEGATIVES_PER_CLASS
             )
-            examples.extend((str(path), 0) for path in paths[:limit])
 
-    # The multi-fruit branch has no bounding-box annotations.  Therefore it
-    # is not used as a positive object-classification set: a filename such as
-    # ``banana_mango.jpg`` tells us that a mango is somewhere in the scene,
-    # not which pixels belong to it.  Images whose filename contains no
-    # mango token are safe, useful hard negatives for rejecting cluttered
-    # multi-fruit photographs at the scene gate.
+    negative_paths = []
+    for paths in negative_classes.values():
+        rng.shuffle(paths)
+        limit = HARD_NEGATIVE_LIMITS.get(key, MAX_NEGATIVES_PER_CLASS)
+        negative_paths.extend(paths[:limit])
+
     if MULTI_SCENE_ROOT.exists():
-        multi_negative_paths = [
+        hard_scene = [
             path for path in sorted(MULTI_SCENE_ROOT.iterdir())
-            if (
-                path.is_file()
-                and path.suffix.lower() in IMAGE_EXTENSIONS
-                and "mango" not in path.stem.lower()
-            )
+            if path.is_file()
+            and path.suffix.lower() in IMAGE_EXTENSIONS
+            and "mango" not in path.stem.lower()
         ]
-        examples.extend(
-            (str(path), 0)
-            for path in multi_negative_paths[:MULTI_SCENE_NEGATIVE_LIMIT]
-        )
-        print(
-            "Added "
-            f"{min(len(multi_negative_paths), MULTI_SCENE_NEGATIVE_LIMIT)} "
-            "mango-free multi-fruit hard negatives."
-        )
+        rng.shuffle(hard_scene)
+        negative_paths.extend(hard_scene[:MULTI_SCENE_NEGATIVE_LIMIT])
 
-    # Include manually verified examples supplied for this project.  These
-    # are especially important hard cases because Fruit-360 photographs have
-    # a different background/style distribution from the application inputs.
-    # The folders are deliberately explicit so a new example cannot silently
-    # change class just because its filename contains a fruit name.
-    for label, folder_name in ((1, "positive"), (0, "negative")):
-        folder = EXTRA_EXAMPLE_ROOT / folder_name
-        if not folder.exists():
-            continue
-        extra_paths = [
-            path for path in sorted(folder.rglob("*"))
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-        ]
-        examples.extend((str(path), label) for path in extra_paths)
-        if extra_paths:
-            print(
-                f"Added {len(extra_paths)} verified {folder_name} "
-                "mango-gate examples."
-            )
+    examples.extend((str(path), 0) for path in negative_paths)
+    negative_count = len(negative_paths)
 
+    print(
+        f"Identity sources: {len([x for x in examples if x[1] == 1])} mango positives, "
+        f"{negative_count} non-mango negatives."
+    )
     if not examples:
         raise RuntimeError("No training images were found for the mango gate.")
     return examples
@@ -168,156 +108,172 @@ def split_examples(examples):
     by_label = {0: [], 1: []}
     for item in examples:
         by_label[item[1]].append(item)
-
     splits = {"train": [], "validation": [], "test": []}
     for label, items in by_label.items():
         rng.shuffle(items)
         test_count = max(1, int(round(len(items) * 0.15)))
         validation_count = max(1, int(round(len(items) * 0.15)))
         splits["test"].extend(items[:test_count])
-        splits["validation"].extend(
-            items[test_count:test_count + validation_count]
-        )
+        splits["validation"].extend(items[test_count:test_count + validation_count])
         splits["train"].extend(items[test_count + validation_count:])
     for items in splits.values():
         rng.shuffle(items)
     return splits
 
 
-class ImageSequence(Sequence):
-    def __init__(self, examples, augment=False):
-        self.examples = list(examples)
-        self.augment = augment
-        self.preprocessor = ImagePreprocessor(resize=IMAGE_SIZE)
-        self.indices = np.arange(len(self.examples))
-        self.augmenter = tf.keras.preprocessing.image.ImageDataGenerator(
-            rotation_range=15,
-            zoom_range=0.12,
-            width_shift_range=0.08,
-            height_shift_range=0.08,
-            horizontal_flip=True,
-            brightness_range=(0.85, 1.15),
-            fill_mode="reflect",
+def prepare_images(examples, preprocessor):
+    """Return segmented and raw views matching application inference."""
+    images, labels = [], []
+    for index, (path, label) in enumerate(examples, start=1):
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Unreadable training image: {path}")
+        # Use the lightweight crop/mask path offline. It has the same
+        # foreground-centered behavior as the CNN input at inference, but
+        # avoids running GrabCut thousands of times during a training run.
+        processed = fast_identity_processed(image, IMAGE_SIZE)
+        segmented = processed["model_segmented_rgb"]
+        raw = cv2.cvtColor(preprocessor.resize_image(image), cv2.COLOR_BGR2RGB)
+        images.extend((segmented, raw))
+        labels.extend((label, label))
+        if index % 250 == 0:
+            print(f"Prepared {index}/{len(examples)} source images.")
+    return np.asarray(images, dtype=np.uint8), np.asarray(labels, dtype=np.float32)
+
+
+def build_cnn(tf):
+    candidate_path = MODEL_PATH.with_name("mango_identifier_cnn_candidate.keras")
+    if candidate_path.exists():
+        return tf.keras.models.load_model(candidate_path, compile=False)
+    if MODEL_PATH.exists():
+        return tf.keras.models.load_model(MODEL_PATH, compile=False)
+
+    inputs = tf.keras.Input(shape=(*IMAGE_SIZE[::-1], 3), name="image_input")
+    try:
+        backbone = tf.keras.applications.MobileNetV2(
+            include_top=False, weights="imagenet", input_shape=(*IMAGE_SIZE[::-1], 3)
         )
-        self.on_epoch_end()
-
-    def __len__(self):
-        return int(np.ceil(len(self.examples) / BATCH_SIZE))
-
-    def on_epoch_end(self):
-        if self.augment:
-            np.random.shuffle(self.indices)
-
-    def __getitem__(self, batch_index):
-        batch_indices = self.indices[
-            batch_index * BATCH_SIZE:(batch_index + 1) * BATCH_SIZE
-        ]
-        images, labels = [], []
-        for index in batch_indices:
-            path, label = self.examples[index]
-            image = cv2.imread(path, cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Unable to read image: {path}")
-            if self.augment:
-                image = letterbox(image)
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                image = self.augmenter.random_transform(image)
-                image = cv2.cvtColor(
-                    np.clip(image, 0, 255).astype(np.uint8),
-                    cv2.COLOR_RGB2BGR,
-                )
-            processed = self.preprocessor.preprocess(image)
-            image = processed["model_segmented_rgb"]
-            images.append(np.clip(image, 0, 255).astype(np.float32))
-            labels.append(float(label))
-        return np.asarray(images), np.asarray(labels, dtype=np.float32)
-
-
-def build_model():
-    base = EfficientNetB0(
-        include_top=False,
-        weights="imagenet",
-        input_shape=(*IMAGE_SIZE, 3),
-        pooling="avg",
-    )
-    base.trainable = False
-    inputs = layers.Input(shape=(*IMAGE_SIZE, 3), name="image_input")
-    x = base(inputs, training=False)
-    x = layers.Dropout(0.35)(x)
-    x = layers.Dense(64, activation="relu")(x)
-    x = layers.Dropout(0.25)(x)
-    outputs = layers.Dense(1, activation="sigmoid", name="mango_probability")(x)
-    model = tf.keras.Model(inputs, outputs, name="MangoIdentityEfficientNetB0")
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
-    )
-    return model, base
+    except Exception:
+        backbone = tf.keras.applications.MobileNetV2(
+            include_top=False, weights=None, input_shape=(*IMAGE_SIZE[::-1], 3)
+        )
+    backbone.trainable = False
+    x = tf.keras.layers.Rescaling(1 / 127.5, offset=-1, name="input_scaling")(inputs)
+    x = backbone(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.35)(x)
+    x = tf.keras.layers.Dense(64, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.25)(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="mango_probability")(x)
+    return tf.keras.Model(inputs, outputs)
 
 
 def train():
+    try:
+        import tensorflow as tf
+    except ImportError as exc:
+        raise RuntimeError("TensorFlow is required to train the CNN identity gate.") from exc
+
     random.seed(SEED)
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
-    examples = collect_examples()
-    splits = split_examples(examples)
+    splits = split_examples(collect_examples())
     print({name: len(items) for name, items in splits.items()})
+    preprocessor = ImagePreprocessor(resize=IMAGE_SIZE)
+    train_x, train_y = prepare_images(splits["train"], preprocessor)
+    validation_x, validation_y = prepare_images(splits["validation"], preprocessor)
+    test_x, test_y = prepare_images(splits["test"], preprocessor)
 
-    train_sequence = ImageSequence(splits["train"], augment=True)
-    validation_sequence = ImageSequence(splits["validation"], augment=False)
-    train_labels = np.asarray([label for _, label in splits["train"]])
-    train_counts = np.bincount(train_labels, minlength=2)
-    total_train = max(1, len(train_labels))
+    augmentation = tf.keras.Sequential([
+        tf.keras.layers.RandomFlip("horizontal"),
+        tf.keras.layers.RandomRotation(0.06),
+        tf.keras.layers.RandomZoom(0.10),
+        tf.keras.layers.RandomContrast(0.12),
+    ], name="identity_augmentation")
+
+    def augment(images, labels):
+        return augmentation(images, training=True), labels
+
+    train_ds = tf.data.Dataset.from_tensor_slices((train_x, train_y))
+    train_ds = train_ds.shuffle(len(train_y), seed=SEED, reshuffle_each_iteration=True)
+    train_ds = train_ds.batch(32).map(augment, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    validation_ds = tf.data.Dataset.from_tensor_slices((validation_x, validation_y)).batch(32)
+
+    model = build_cnn(tf)
+    backbone = next(
+        (layer for layer in model.layers if "mobilenetv2" in layer.name.lower()),
+        None,
+    )
+    if backbone is not None:
+        backbone.trainable = False
+    negative_count = max(1, int(np.sum(train_y == 0)))
+    positive_count = max(1, int(np.sum(train_y == 1)))
     class_weight = {
-        index: total_train / (2.0 * max(1, count))
-        for index, count in enumerate(train_counts)
+        0: 0.5 * len(train_y) / negative_count,
+        1: 0.5 * len(train_y) / positive_count,
     }
-    model, base = build_model()
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            MODEL_PATH, monitor="val_auc", mode="max", save_best_only=True
-        ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_auc", mode="max", patience=4, restore_best_weights=True
-        ),
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss", factor=0.5, patience=2, min_lr=1e-6
-        ),
-    ]
-    model.fit(
-        train_sequence,
-        validation_data=validation_sequence,
-        epochs=15,
-        class_weight=class_weight,
-        callbacks=callbacks,
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=2e-5),
+        loss=tf.keras.losses.BinaryCrossentropy(),
+        metrics=[
+            tf.keras.metrics.BinaryAccuracy(name="accuracy"),
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ],
     )
 
-    # Fine-tune only the final EfficientNet layers; the dataset is too small
-    # to safely update the entire ImageNet backbone.
-    base.trainable = True
-    for layer in base.layers[:-20]:
-        layer.trainable = False
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
-    )
-    model.fit(
-        train_sequence,
-        validation_data=validation_sequence,
-        epochs=10,
+    candidate_path = MODEL_PATH.with_name("mango_identifier_cnn_candidate.keras")
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(candidate_path, monitor="val_auc", mode="max", save_best_only=True),
+        tf.keras.callbacks.EarlyStopping(monitor="val_auc", mode="max", patience=1, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_auc", mode="max", factor=0.3, patience=1, min_lr=1e-7),
+    ]
+    history = model.fit(
+        train_ds,
+        validation_data=validation_ds,
+        epochs=3,
         class_weight=class_weight,
         callbacks=callbacks,
+        verbose=2,
     )
-    test_metrics = model.evaluate(
-        ImageSequence(splits["test"], augment=False),
-        verbose=0,
-        return_dict=True,
-    )
+
+    if candidate_path.exists():
+        model = tf.keras.models.load_model(candidate_path, compile=False)
     model.save(MODEL_PATH)
-    print(f"Test metrics: {test_metrics}")
-    print(f"Saved mango identity model to {MODEL_PATH}")
+
+    probabilities = model.predict(test_x, batch_size=32, verbose=0).reshape(-1)
+    source_probabilities = probabilities.reshape(-1, 2).mean(axis=1)
+    source_labels = test_y.reshape(-1, 2)[:, 0]
+    predictions = source_probabilities >= OPERATING_THRESHOLD
+    accuracy = float(np.mean(predictions == source_labels))
+    tp = int(np.sum(predictions & (source_labels == 1)))
+    tn = int(np.sum(~predictions & (source_labels == 0)))
+    fp = int(np.sum(predictions & (source_labels == 0)))
+    fn = int(np.sum(~predictions & (source_labels == 1)))
+    precision = tp / max(1, tp + fp)
+    recall = tp / max(1, tp + fn)
+    print(f"Test accuracy: {accuracy * 100:.2f}%")
+    print(f"Mango precision: {precision * 100:.2f}% | mango recall: {recall * 100:.2f}%")
+    print(f"Confusion matrix: TN={tn}, FP={fp}, FN={fn}, TP={tp}")
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    METADATA_PATH.write_text(json.dumps({
+        "model": MODEL_PATH.name,
+        "model_type": "MobileNetV2 binary CNN",
+        "input_size": list(IMAGE_SIZE),
+        "positive_label": "mango",
+        "negative_label": "non-mango",
+        "threshold": OPERATING_THRESHOLD,
+        "test_accuracy": accuracy,
+        "test_precision": precision,
+        "test_recall": recall,
+        "epochs_trained": len(history.history.get("loss", [])),
+    }, indent=2), encoding="utf-8")
+    if candidate_path.exists():
+        candidate_path.unlink()
+    print(f"Saved CNN identity model to {MODEL_PATH}")
+    print(f"Saved training metadata to {METADATA_PATH}")
 
 
 if __name__ == "__main__":

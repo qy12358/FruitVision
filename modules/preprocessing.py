@@ -475,6 +475,24 @@ class ImagePreprocessor:
                  & (grab_s >= 75) & (grab_v <= 220))
                 & (grab_candidate > 0)
             )
+            # Pale Harumanis skin can be bright and low-saturation, so it
+            # falls outside the strict HSV green seed above. In darker
+            # brown/gray scenes, use channel dominance as an additional
+            # fruit seed: mango skin is usually green-dominant while the
+            # background is not. This prevents the background from becoming
+            # one connected foreground region and avoids clipping the fruit.
+            source_blue, source_green, source_red = cv2.split(grab_source)
+            green_dominant = (
+                (source_green.astype(np.float32) >= 1.03 * source_red)
+                & (source_green.astype(np.float32) >= 1.03 * source_blue)
+            )
+            pale_green_seed = (
+                (grab_h >= 25) & (grab_h <= 105)
+                & (grab_s >= 20) & (grab_v >= 45)
+                & green_dominant
+                & (grab_candidate > 0)
+            )
+            green_seed = green_seed | pale_green_seed
             # Prefer warm fruit pixels because green foliage is a common
             # false foreground.  Fall back to green only when the image has
             # no meaningful warm fruit evidence (e.g. an unripe green mango
@@ -493,6 +511,52 @@ class ImagePreprocessor:
                 cv2.MORPH_CLOSE,
                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
             )
+            # Bright green mango skin can have saturation below the green
+            # seed threshold. In that case GrabCut was seeded only by the
+            # darker stem, producing the exact failure where the stem remains
+            # white and the mango body disappears. Use the largest candidate
+            # component as a conservative fruit seed when colour seeds cover
+            # too little of the candidate foreground.
+            candidate_area = max(1, cv2.countNonZero(grab_candidate))
+            seed_area = cv2.countNonZero(fruit_seed)
+            if seed_area < 0.20 * candidate_area:
+                component_count, component_labels, component_stats, _ = (
+                    cv2.connectedComponentsWithStats(
+                        grab_candidate,
+                        connectivity=8,
+                    )
+                )
+                component_labels_to_try = sorted(
+                    range(1, component_count),
+                    key=lambda label: component_stats[label, cv2.CC_STAT_AREA],
+                    reverse=True,
+                )
+                fallback_label = None
+                for label in component_labels_to_try:
+                    component_area = component_stats[label, cv2.CC_STAT_AREA]
+                    if component_area < 0.03 * grab_candidate.size:
+                        break
+                    if fallback_label is None:
+                        fallback_label = label
+                    component_x = component_stats[label, cv2.CC_STAT_LEFT]
+                    component_y = component_stats[label, cv2.CC_STAT_TOP]
+                    component_w = component_stats[label, cv2.CC_STAT_WIDTH]
+                    component_h = component_stats[label, cv2.CC_STAT_HEIGHT]
+                    touches_frame = (
+                        component_x == 0
+                        or component_y == 0
+                        or component_x + component_w >= width
+                        or component_y + component_h >= height
+                    )
+                    if not touches_frame:
+                        fallback_label = label
+                        break
+                if fallback_label is not None:
+                    fruit_seed = np.where(
+                        component_labels == fallback_label,
+                        255,
+                        0,
+                    ).astype(np.uint8)
             grabcut_mask[fruit_seed == 0] = cv2.GC_PR_BGD
             grabcut_mask[grab_candidate == 0] = cv2.GC_BGD
             grabcut_mask[fruit_seed > 0] = cv2.GC_PR_FGD
@@ -533,10 +597,57 @@ class ImagePreprocessor:
                             (native_width, native_height),
                             interpolation=cv2.INTER_NEAREST,
                         )
+                    native_fruit_seed = (
+                        cv2.resize(
+                            fruit_seed,
+                            (native_width, native_height),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        if proxy_scale < 1.0
+                        else fruit_seed
+                    )
                     mask = cv2.bitwise_and(
                         grabcut_foreground,
                         candidate,
                     )
+                    # If the HSV candidate touches the frame, it may contain
+                    # a dark/brown background connected to the mango. When
+                    # GrabCut returns that background-connected region, use
+                    # the largest clean pale-green seed component instead.
+                    # This is especially important for green Harumanis fruit
+                    # photographed against brown or gray backgrounds.
+                    seed_count, seed_labels, seed_stats, _ = (
+                        cv2.connectedComponentsWithStats(
+                            native_fruit_seed,
+                            connectivity=8,
+                        )
+                    )
+                    if seed_count > 1:
+                        largest_seed_label = 1 + int(
+                            np.argmax(seed_stats[1:, cv2.CC_STAT_AREA])
+                        )
+                        largest_seed_area = int(
+                            seed_stats[largest_seed_label, cv2.CC_STAT_AREA]
+                        )
+                        largest_seed = np.where(
+                            seed_labels == largest_seed_label,
+                            255,
+                            0,
+                        ).astype(np.uint8)
+                        seed_is_substantial = (
+                            largest_seed_area >= 0.05 * candidate.size
+                        )
+                        candidate_touches_frame = border_candidate_ratio > 0.01
+                        graphcut_area = cv2.countNonZero(mask)
+                        if (
+                            seed_is_substantial
+                            and candidate_touches_frame
+                            and graphcut_area > 1.20 * largest_seed_area
+                        ):
+                            mask = cv2.bitwise_and(
+                                largest_seed,
+                                candidate,
+                            )
                     # A graph cut that retains almost the whole frame has
                     # failed to separate a natural background.  In that
                     # case, use the conservative fruit-colour seed instead
@@ -553,10 +664,263 @@ class ImagePreprocessor:
                                 interpolation=cv2.INTER_NEAREST,
                             )
                         mask = cv2.bitwise_and(fruit_seed, candidate)
+
+                    # GrabCut can keep only a high-contrast stem or branch
+                    # when a pale green mango has nearly the same colour as
+                    # its background.  Recover the dominant candidate
+                    # component when the graph-cut result has little overlap
+                    # with it.  The identity gate still decides whether this
+                    # recovered foreground is actually a mango.
+                    candidate_count, candidate_labels, candidate_stats, _ = (
+                        cv2.connectedComponentsWithStats(
+                            candidate,
+                            connectivity=8,
+                        )
+                    )
+                    if candidate_count > 1:
+                        candidate_labels_to_try = sorted(
+                            range(1, candidate_count),
+                            key=lambda label: candidate_stats[
+                                label,
+                                cv2.CC_STAT_AREA,
+                            ],
+                            reverse=True,
+                        )
+                        largest_candidate_label = candidate_labels_to_try[0]
+                        for label in candidate_labels_to_try:
+                            component_area = candidate_stats[
+                                label,
+                                cv2.CC_STAT_AREA,
+                            ]
+                            if component_area < 0.03 * candidate.size:
+                                break
+                            component_x = candidate_stats[
+                                label,
+                                cv2.CC_STAT_LEFT,
+                            ]
+                            component_y = candidate_stats[
+                                label,
+                                cv2.CC_STAT_TOP,
+                            ]
+                            component_w = candidate_stats[
+                                label,
+                                cv2.CC_STAT_WIDTH,
+                            ]
+                            component_h = candidate_stats[
+                                label,
+                                cv2.CC_STAT_HEIGHT,
+                            ]
+                            touches_frame = (
+                                component_x == 0
+                                or component_y == 0
+                                or component_x + component_w >= candidate.shape[1]
+                                or component_y + component_h >= candidate.shape[0]
+                            )
+                            if not touches_frame:
+                                largest_candidate_label = label
+                                break
+                        largest_candidate_area = candidate_stats[
+                            largest_candidate_label,
+                            cv2.CC_STAT_AREA,
+                        ]
+                        largest_candidate = np.where(
+                            candidate_labels == largest_candidate_label,
+                            255,
+                            0,
+                        ).astype(np.uint8)
+                        largest_overlap = cv2.countNonZero(
+                            cv2.bitwise_and(mask, largest_candidate)
+                        )
+                        graphcut_area = cv2.countNonZero(mask)
+                        # A pale/dark green mango can have strong overlap
+                        # with the candidate while GrabCut still contracts
+                        # one side of the silhouette.  Recover the dominant
+                        # isolated candidate in that case; otherwise the
+                        # downstream classifier receives a visibly clipped
+                        # mango.  The existing low-overlap branch remains for
+                        # cases where GrabCut selects the wrong object.
+                        if (
+                            largest_candidate_area >= 0.03 * candidate.size
+                            and (
+                                (
+                                    largest_overlap < 0.35 * largest_candidate_area
+                                    and graphcut_area < 0.60 * largest_candidate_area
+                                )
+                                or (
+                                    largest_overlap >= 0.65 * largest_candidate_area
+                                    and graphcut_area < 0.90 * largest_candidate_area
+                                )
+                            )
+                        ):
+                            mask = largest_candidate
                 except cv2.error:
-                    # Keep the deterministic candidate for degenerate or
-                    # very small inputs where GrabCut cannot initialize.
-                    mask = candidate.copy()
+                    # GrabCut can fail to initialize on high-resolution,
+                    # low-contrast scenes. Prefer the validated green fruit
+                    # seed in that case; reverting to the raw candidate can
+                    # reintroduce a background-connected mask.
+                    native_fruit_seed = (
+                        cv2.resize(
+                            fruit_seed,
+                            (native_width, native_height),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        if proxy_scale < 1.0
+                        else fruit_seed
+                    )
+                    seed_count, seed_labels, seed_stats, _ = (
+                        cv2.connectedComponentsWithStats(
+                            native_fruit_seed,
+                            connectivity=8,
+                        )
+                    )
+                    if seed_count > 1:
+                        largest_seed_label = 1 + int(
+                            np.argmax(seed_stats[1:, cv2.CC_STAT_AREA])
+                        )
+                        largest_seed_area = int(
+                            seed_stats[largest_seed_label, cv2.CC_STAT_AREA]
+                        )
+                        if largest_seed_area >= 0.05 * candidate.size:
+                            mask = np.where(
+                                seed_labels == largest_seed_label,
+                                255,
+                                0,
+                            ).astype(np.uint8)
+                        else:
+                            mask = candidate.copy()
+                    else:
+                        mask = candidate.copy()
+
+        # ================================================================
+        # BACKGROUND-CONNECTED CANDIDATE RECOVERY
+        # ================================================================
+        #
+        # The saturation/value candidate is intentionally permissive, but
+        # that means a brown or gray wall can become one large connected
+        # component with a pale green unripe mango.  GrabCut can then return
+        # the wall as foreground and the later component selection keeps a
+        # clipped or scene-sized object.  Before the leaf and morphology
+        # stages, recover the largest connected pale-green component from
+        # the original BGR image.  This is a fallback only when the HSV
+        # candidate touches the frame and the colour component is substantial
+        # and overlaps the current foreground.
+        if (
+            source_bgr is not None
+            and source_bgr.shape[:2] == hsv_image.shape[:2]
+            and border_candidate_ratio > 0.01
+        ):
+            source_blue, source_green, source_red = cv2.split(source_bgr)
+            pale_green_recovery = (
+                (h >= 25) & (h <= 105)
+                & (s >= 18) & (v >= 45)
+                & (source_green.astype(np.float32) >= 1.03 * source_red)
+                & (source_green.astype(np.float32) >= 1.03 * source_blue)
+            ).astype(np.uint8) * 255
+            pale_green_recovery = cv2.bitwise_and(
+                pale_green_recovery,
+                candidate,
+            )
+            pale_green_recovery = cv2.morphologyEx(
+                pale_green_recovery,
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            )
+            pale_green_recovery = cv2.morphologyEx(
+                pale_green_recovery,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            )
+            recovery_count, recovery_labels, recovery_stats, _ = (
+                cv2.connectedComponentsWithStats(
+                    pale_green_recovery,
+                    connectivity=8,
+                )
+            )
+            if recovery_count > 1:
+                recovery_label = 1 + int(
+                    np.argmax(recovery_stats[1:, cv2.CC_STAT_AREA])
+                )
+                recovery_area = int(
+                    recovery_stats[recovery_label, cv2.CC_STAT_AREA]
+                )
+                current_area = cv2.countNonZero(mask)
+                recovery_component = np.where(
+                    recovery_labels == recovery_label,
+                    255,
+                    0,
+                ).astype(np.uint8)
+                recovery_overlap = cv2.countNonZero(
+                    cv2.bitwise_and(mask, recovery_component)
+                )
+                if (
+                    recovery_area >= 0.05 * candidate.size
+                    and recovery_overlap >= 0.15 * recovery_area
+                    and (
+                        current_area > 1.15 * recovery_area
+                        or cv2.countNonZero(candidate) > 1.50 * recovery_area
+                    )
+                ):
+                    # The stem of an unripe Harumanis mango can be yellow
+                    # rather than green, so it may be a separate colour
+                    # component just above the body. Include only small
+                    # nearby yellow/green components; a large component is
+                    # usually the brown/gray background connected to the
+                    # permissive HSV candidate.
+                    attached_colour = (
+                        (h >= 20) & (h <= 105)
+                        & (s >= 20) & (v >= 45)
+                        & (source_green.astype(np.float32) >= 0.75 * source_red)
+                        & (source_green.astype(np.float32) >= 1.15 * source_blue)
+                    ).astype(np.uint8) * 255
+                    attached_colour = cv2.bitwise_and(
+                        attached_colour,
+                        candidate,
+                    )
+                    attached_colour = cv2.morphologyEx(
+                        attached_colour,
+                        cv2.MORPH_OPEN,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                    )
+                    attached_count, attached_labels, attached_stats, _ = (
+                        cv2.connectedComponentsWithStats(
+                            attached_colour,
+                            connectivity=8,
+                        )
+                    )
+                    near_body = cv2.dilate(
+                        recovery_component,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51)),
+                    )
+                    recovered_mask = recovery_component.copy()
+                    for attached_label in range(1, attached_count):
+                        attached_area = int(
+                            attached_stats[attached_label, cv2.CC_STAT_AREA]
+                        )
+                        if not (
+                            0.001 * candidate.size <= attached_area
+                            <= 0.10 * candidate.size
+                        ):
+                            continue
+                        attached_component = np.where(
+                            attached_labels == attached_label,
+                            255,
+                            0,
+                        ).astype(np.uint8)
+                        if cv2.countNonZero(
+                            cv2.bitwise_and(attached_component, near_body)
+                        ) > 0:
+                            recovered_mask = cv2.bitwise_or(
+                                recovered_mask,
+                                attached_component,
+                            )
+                    # Close the small gap between a detached stem component
+                    # and the fruit body so the final largest-component
+                    # filter retains the complete mango object.
+                    mask = cv2.morphologyEx(
+                        recovered_mask,
+                        cv2.MORPH_CLOSE,
+                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (51, 51)),
+                    )
 
         # ================================================================
         # LEAF LAYER

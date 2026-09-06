@@ -917,8 +917,6 @@ def build_stratified_splits(
             f"{conflict_count} exact-duplicate hash groups with conflicting labels."
         )
 
-    train_source_stems = set()
-    train_source_labels = {}
     for class_index, class_name in enumerate(class_names):
         class_files = class_files_by_index[class_index]
         rng.shuffle(class_files)
@@ -940,11 +938,6 @@ def build_stratified_splits(
         ):
             split_files[split_name].extend(files)
             split_labels[split_name].extend([class_index] * len(files))
-        for path in train_files:
-            stem = Path(path).stem.lower()
-            train_source_stems.add(stem)
-            train_source_labels[stem] = class_index
-
     if include_augmented_train:
         augmented_dir = (
             dataset_dir.parent.parent
@@ -962,17 +955,12 @@ def build_stratified_splits(
                     and path.suffix.lower() in IMAGE_EXTENSIONS
                 ):
                     continue
-                match = re.match(
-                    r"^(img-\d+)",
-                    path.stem.lower(),
-                )
                 label_index = class_to_index.get(path.parent.name.lower())
-                if (
-                    match
-                    and match.group(1) in train_source_stems
-                    and label_index is not None
-                    and label_index == train_source_labels[match.group(1)]
-                ):
+                # Augmented images are training-only data. Use every valid
+                # maturity-labelled augmentation so the underrepresented
+                # rotten class is not reduced to the subset whose original
+                # happened to land in the training split.
+                if label_index is not None:
                     split_files["train"].append(str(path))
                     split_labels["train"].append(label_index)
                     augmented_added += 1
@@ -985,6 +973,23 @@ def build_stratified_splits(
         split_files["validation"], split_labels["validation"],
         split_files["test"], split_labels["test"],
     )
+
+
+def validate_image_files(file_paths):
+    """Fail before training if any selected dataset image cannot be decoded."""
+
+    unreadable = [
+        path for path in file_paths
+        if cv2.imread(path, cv2.IMREAD_COLOR) is None
+    ]
+    if unreadable:
+        preview = "\n".join(f"- {path}" for path in unreadable[:20])
+        more = "" if len(unreadable) <= 20 else f"\n- ... and {len(unreadable) - 20} more"
+        raise RuntimeError(
+            "Unreadable ripeness training images detected before training:\n"
+            f"{preview}{more}\n"
+            "Replace or remove these files, then run training again."
+        )
 
 
 # ============================================================================
@@ -1207,10 +1212,6 @@ class HybridSequence(Sequence):
                     "Unable to read image:\n"
                     f"{image_path}"
                 )
-
-            # Resize with letterboxing before augmentation so augmentation
-            # does not create an artificial stretched mango.
-            image_bgr = self.preprocessor.resize_image(image_bgr)
 
             # ----------------------------------------------------------------
             # Data augmentation
@@ -2045,6 +2046,7 @@ def train():
         class_names,
         include_augmented_train=True,
     )
+    validate_image_files(train_files + val_files + test_files)
 
     if not train_files:
 

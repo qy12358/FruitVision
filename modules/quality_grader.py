@@ -15,6 +15,96 @@ class QualityGrader:
     MAXIMUM_ACCEPTABLE_LIMIT = 10.0
     VALID_RIPENESS = {"ripe", "semi_ripe", "unripe", "rotten"}
 
+    # This is the grading specification supplied for the application.  Keep
+    # the interpretations alongside the thresholds so the result is
+    # auditable in the UI and in saved assessment records.
+    RULES = (
+        {
+            "ripeness": "ripe",
+            "blemish": "<=5%",
+            "damage": "<=5%",
+            "grade": "Premium",
+            "interpretation": "Best maturity condition and minimal surface defects",
+        },
+        {
+            "ripeness": "semi_ripe",
+            "blemish": "<=5%",
+            "damage": "<=5%",
+            "grade": "Grade 1",
+            "interpretation": "Good quality but not yet fully ripe",
+        },
+        {
+            "ripeness": "unripe",
+            "blemish": "<=5%",
+            "damage": "<=5%",
+            "grade": "Grade 2",
+            "interpretation": "Clean surface but immature",
+        },
+        {
+            "ripeness": "ripe",
+            "blemish": ">5% and <=10%",
+            "damage": "<=5%",
+            "grade": "Grade 1",
+            "interpretation": "Good maturity with moderate cosmetic blemish",
+        },
+        {
+            "ripeness": "semi_ripe",
+            "blemish": ">5% and <=10%",
+            "damage": "<=5%",
+            "grade": "Grade 2",
+            "interpretation": "Incomplete maturity plus noticeable blemish",
+        },
+        {
+            "ripeness": "unripe",
+            "blemish": ">5% and <=10%",
+            "damage": "<=5%",
+            "grade": "Grade 2",
+            "interpretation": "Already limited by immature condition",
+        },
+        {
+            "ripeness": "ripe",
+            "blemish": "<=10%",
+            "damage": ">5% and <=10%",
+            "grade": "Grade 2",
+            "interpretation": "Correct maturity but noticeable physical damage",
+        },
+        {
+            "ripeness": "semi_ripe",
+            "blemish": "<=10%",
+            "damage": ">5% and <=10%",
+            "grade": "Grade 2",
+            "interpretation": "Incomplete maturity and damage",
+        },
+        {
+            "ripeness": "unripe",
+            "blemish": "<=10%",
+            "damage": ">5% and <=10%",
+            "grade": "Grade 2",
+            "interpretation": "Immature and damaged",
+        },
+        {
+            "ripeness": "any",
+            "blemish": ">10%",
+            "damage": "Any",
+            "grade": "Reject",
+            "interpretation": "Excessive blemish",
+        },
+        {
+            "ripeness": "any",
+            "blemish": "Any",
+            "damage": ">10%",
+            "grade": "Reject",
+            "interpretation": "Excessive damage",
+        },
+        {
+            "ripeness": "rotten",
+            "blemish": "Any",
+            "damage": "Any",
+            "grade": "Reject",
+            "interpretation": "Deteriorated fruit",
+        },
+    )
+
     @staticmethod
     def _normalise_ripeness(value):
         if value is None:
@@ -75,78 +165,33 @@ class QualityGrader:
             }
 
         if ripeness_text == "rotten":
-            grade = "Reject"
-            reasons = ["Deteriorated fruit is Rotten and must be rejected."]
+            matched_rule = self.RULES[-1]
         elif blemish > self.MAXIMUM_ACCEPTABLE_LIMIT:
-            grade = "Reject"
-            reasons = [
-                "Excessive blemish: coverage is above 10%.",
-            ]
+            matched_rule = self.RULES[-3]
         elif damage > self.MAXIMUM_ACCEPTABLE_LIMIT:
-            grade = "Reject"
-            reasons = [
-                "Excessive damage: coverage is above 10%.",
-            ]
+            matched_rule = self.RULES[-2]
+        elif blemish <= self.PREMIUM_LIMIT and damage <= self.PREMIUM_LIMIT:
+            matched_rule = {
+                "ripe": self.RULES[0],
+                "semi_ripe": self.RULES[1],
+                "unripe": self.RULES[2],
+            }[ripeness_text]
+        elif blemish > self.PREMIUM_LIMIT and damage <= self.PREMIUM_LIMIT:
+            matched_rule = {
+                "ripe": self.RULES[3],
+                "semi_ripe": self.RULES[4],
+                "unripe": self.RULES[5],
+            }[ripeness_text]
         else:
-            low_blemish = blemish <= self.PREMIUM_LIMIT
-            low_damage = damage <= self.PREMIUM_LIMIT
+            matched_rule = {
+                "ripe": self.RULES[6],
+                "semi_ripe": self.RULES[7],
+                "unripe": self.RULES[8],
+            }[ripeness_text]
 
-            if low_blemish and low_damage:
-                grade, reasons = {
-                    "ripe": (
-                        "Premium",
-                        [
-                            "Optimal eating stage with minimal visible "
-                            "defect/damage."
-                        ],
-                    ),
-                    "semi_ripe": (
-                        "Grade 1",
-                        ["Good condition but not yet at optimal ripe stage."],
-                    ),
-                    "unripe": (
-                        "Grade 2",
-                        [
-                            "Surface may be excellent, but fruit is not "
-                            "ready for normal consumption."
-                        ],
-                    ),
-                }[ripeness_text]
-            elif low_damage and blemish <= self.MAXIMUM_ACCEPTABLE_LIMIT:
-                grade, reasons = {
-                    "ripe": (
-                        "Grade 1",
-                        [
-                            "Good ripeness but noticeable cosmetic defects."
-                        ],
-                    ),
-                    "semi_ripe": (
-                        "Grade 2",
-                        [
-                            "Both maturity and appearance reduce overall "
-                            "quality."
-                        ],
-                    ),
-                    "unripe": (
-                        "Grade 2",
-                        ["Already limited by immature condition."],
-                    ),
-                }[ripeness_text]
-            elif damage <= self.MAXIMUM_ACCEPTABLE_LIMIT:
-                grade, reasons = {
-                    "ripe": (
-                        "Grade 2",
-                        ["Appropriate ripeness but significant damage."],
-                    ),
-                    "semi_ripe": (
-                        "Grade 2",
-                        ["Damage and incomplete ripeness reduce quality."],
-                    ),
-                    "unripe": (
-                        "Grade 2",
-                        ["Lowest acceptable overall quality."],
-                    ),
-                }[ripeness_text]
+        grade = matched_rule["grade"]
+        interpretation = matched_rule["interpretation"]
+        reasons = [interpretation]
 
         return {
             "available": True,
@@ -156,6 +201,8 @@ class QualityGrader:
             "ripeness": ripeness,
             "reason": " ".join(reasons),
             "reasons": reasons,
+            "interpretation": interpretation,
+            "rule": dict(matched_rule),
         }
 
 

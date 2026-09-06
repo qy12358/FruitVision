@@ -1,11 +1,11 @@
-"""Mango identity gate used before ripeness classification.
+"""CNN mango/non-mango identity gate used before ripeness classification.
 
 Ripeness is a four-class problem, so a ripeness model must not be asked to
 decide whether an arbitrary input is a mango.  This module provides that
-separate gate.  If ``models/mango_identifier.keras`` exists, its probability
-is combined with image-processing evidence.  Before the binary model is
-trained, the conservative HSV/contour fallback still rejects most obvious
-non-mango inputs and prevents a ripeness label from being shown for them.
+separate binary gate.  The trained MobileNetV2 CNN is the required decision
+maker; the classical image-processing values are retained as audit evidence.
+If the trained gate is unavailable, the module fails closed instead of
+guessing from colour or shape.
 """
 
 from pathlib import Path
@@ -16,42 +16,154 @@ import numpy as np
 from modules.preprocessing import ImagePreprocessor
 
 
+def fast_identity_processed(image: np.ndarray, input_size=(128, 128)) -> dict:
+    """Make the lightweight, shared training/inference identity tensor."""
+    resized = cv2.resize(image, input_size, interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    background = np.all(rgb >= 245, axis=2) | np.all(rgb <= 10, axis=2)
+    mask = (~background).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        contour = max(contours, key=cv2.contourArea)
+        x, y, width, height = cv2.boundingRect(contour)
+        padding = max(2, int(round(0.08 * max(width, height))))
+        x0, y0 = max(0, x - padding), max(0, y - padding)
+        x1, y1 = min(rgb.shape[1], x + width + padding), min(rgb.shape[0], y + height + padding)
+        crop, crop_mask = rgb[y0:y1, x0:x1], mask[y0:y1, x0:x1]
+        scale = min(input_size[0] / crop.shape[1], input_size[1] / crop.shape[0])
+        new_size = (max(1, int(round(crop.shape[1] * scale))), max(1, int(round(crop.shape[0] * scale))))
+        crop = cv2.resize(crop, new_size, interpolation=cv2.INTER_AREA)
+        crop_mask = cv2.resize(crop_mask, new_size, interpolation=cv2.INTER_NEAREST)
+        canvas = np.zeros((*input_size[::-1], 3), dtype=np.uint8)
+        canvas_mask = np.zeros(input_size[::-1], dtype=np.uint8)
+        ox, oy = (input_size[0] - new_size[0]) // 2, (input_size[1] - new_size[1]) // 2
+        canvas[oy:oy + new_size[1], ox:ox + new_size[0]] = crop
+        canvas_mask[oy:oy + new_size[1], ox:ox + new_size[0]] = crop_mask
+        rgb, mask = canvas, canvas_mask
+    segmented_rgb = cv2.bitwise_and(rgb, rgb, mask=mask)
+    return {"model_segmented_rgb": segmented_rgb, "model_segmented_hsv": cv2.cvtColor(segmented_rgb, cv2.COLOR_RGB2HSV)}
+
+
+def extract_identity_features(processed: dict) -> np.ndarray:
+    """Build a compact, model-independent feature vector for identity."""
+    rgb = processed["model_segmented_rgb"].astype(np.uint8)
+    hsv = processed["model_segmented_hsv"]
+    mask = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) > 0
+    if not np.any(mask):
+        mask = np.ones(rgb.shape[:2], dtype=bool)
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    # A small grayscale/edge thumbnail is much faster than HOG while still
+    # capturing the silhouette and surface texture needed by the SVM.
+    texture = cv2.resize(gray, (20, 20), interpolation=cv2.INTER_AREA).ravel()
+    edges = cv2.Canny((gray * 255).astype(np.uint8), 40, 120)
+    edge_thumbnail = (
+        cv2.resize(edges, (12, 12), interpolation=cv2.INTER_AREA).ravel() / 255.0
+    )
+    colour = []
+    for channel, bins, value_range in (
+        (hsv[..., 0], 18, (0, 180)),
+        (hsv[..., 1], 16, (0, 256)),
+        (hsv[..., 2], 16, (0, 256)),
+    ):
+        histogram, _ = np.histogram(
+            channel[mask], bins=bins, range=value_range
+        )
+        histogram = histogram.astype(np.float32)
+        colour.extend(histogram / max(float(histogram.sum()), 1.0))
+
+    contour = MangoIdentifier._largest_contour(
+        (mask.astype(np.uint8) * 255)
+    )
+    shape = [float(mask.mean())]
+    if contour is not None:
+        contour_area = max(float(cv2.contourArea(contour)), 1.0)
+        hull_area = max(float(cv2.contourArea(cv2.convexHull(contour))), 1.0)
+        perimeter = max(float(cv2.arcLength(contour, True)), 1.0)
+        x, y, width, height = cv2.boundingRect(contour)
+        shape.extend([
+            contour_area / hull_area,
+            contour_area / max(float(width * height), 1.0),
+            4.0 * np.pi * contour_area / (perimeter * perimeter),
+            max(width, height) / max(min(width, height), 1),
+        ])
+    else:
+        shape.extend([0.0, 0.0, 0.0, 0.0])
+    return np.concatenate([
+        texture.astype(np.float32),
+        edge_thumbnail.astype(np.float32),
+        np.asarray(colour + shape, dtype=np.float32),
+    ])
+
+
 class MangoIdentifier:
     """Detect whether an image contains one mango suitable for analysis."""
 
     def __init__(
         self,
         model_path: str = "models/mango_identifier.keras",
-        input_size: tuple = (224, 224),
-        acceptance_threshold: float = 0.55,
-        cnn_threshold: float = 0.40,
+        input_size: tuple = (128, 128),
+        acceptance_threshold: float = 0.75,
+        cnn_threshold: float = 0.85,
+        allow_legacy_sklearn: bool = False,
     ):
         self.model_path = Path(model_path)
         self.input_size = input_size
         self.acceptance_threshold = acceptance_threshold
-        # The original 0.50 cutoff rejected the green/yellow multi-mango
-        # example even though its combined evidence was strong.  The gate is
-        # calibrated with the verified examples in dataset/mango_gate_examples
-        # and uses the combined score plus explicit hard negatives.
+        # The gate is trained from the Harumanis mango dataset and hard
+        # non-mango classes. A green/oval object alone must never be enough
+        # to call something a mango.
         self.cnn_threshold = cnn_threshold
+        self.allow_legacy_sklearn = allow_legacy_sklearn
         self.preprocessor = ImagePreprocessor(resize=input_size)
+        self.cnn_preprocessor = ImagePreprocessor(resize=(224, 224))
         self.model = None
+        self.model_kind = None
 
-        # TensorFlow is intentionally optional here.  The classical gate is
-        # useful during development and keeps the application usable until
-        # the binary identity model has been trained.
-        if self.model_path.exists():
+        # Prefer the CNN explicitly. A stale joblib file must never silently
+        # override a newly trained CNN just because the old default path is
+        # still present.
+        keras_candidates = [self.model_path]
+        if self.model_path.suffix.lower() != ".keras":
+            keras_candidates.insert(0, self.model_path.with_suffix(".keras"))
+        for keras_path in keras_candidates:
+            if not keras_path.exists():
+                continue
             try:
                 import tensorflow as tf
 
-                self.model = tf.keras.models.load_model(
-                    self.model_path,
-                    compile=False,
-                )
+                self.model = tf.keras.models.load_model(keras_path, compile=False)
+                self.model_kind = "keras"
+                self.model_path = keras_path
+                break
             except Exception:
-                # A broken optional model must not make the app crash.  The
-                # fallback below remains conservative and explainable.
                 self.model = None
+
+        # A legacy classical classifier is opt-in only. Its colour/shape
+        # features are useful audit evidence, but cannot safely identify an
+        # arbitrary user-uploaded fruit such as papaya by themselves.
+        if self.model is None and self.allow_legacy_sklearn:
+            joblib_candidates = [self.model_path]
+            if self.model_path.suffix.lower() != ".joblib":
+                joblib_candidates.append(self.model_path.with_suffix(".joblib"))
+            for joblib_path in joblib_candidates:
+                if not joblib_path.exists():
+                    continue
+                try:
+                    import joblib
+
+                    loaded_model = joblib.load(joblib_path)
+                    self.model = (
+                        loaded_model["classifier"]
+                        if isinstance(loaded_model, dict) and "classifier" in loaded_model
+                        else loaded_model
+                    )
+                    self.model_kind = "sklearn"
+                    self.model_path = joblib_path
+                    break
+                except Exception:
+                    self.model = None
 
     @staticmethod
     def _largest_contour(mask: np.ndarray):
@@ -95,6 +207,8 @@ class MangoIdentifier:
                 "round_yellow_fruit": False,
                 "green_ratio": 0.0,
                 "green_leaf_like": False,
+                "papaya_like": False,
+                "apple_like": False,
                 "classical_score": 0.0,
             }
 
@@ -240,6 +354,19 @@ class MangoIdentifier:
             and extent < 0.55
             and circularity < 0.65
         )
+        papaya_like = (
+            yellow_ratio >= 0.85
+            and warm_hue_median >= 25.0
+            and aspect_ratio >= 2.0
+            and extent >= 0.60
+            and circularity >= 0.55
+        )
+        apple_like = (
+            warm_ratio >= 0.80
+            and aspect_ratio <= 2.0
+            and extent < 0.55
+            and circularity < 0.45
+        )
 
         # A mango is normally a single, compact, coloured foreground object.
         # These are evidence scores, not ripeness rules.
@@ -277,6 +404,8 @@ class MangoIdentifier:
             "round_yellow_fruit": round_yellow_fruit,
             "green_ratio": green_ratio,
             "green_leaf_like": green_leaf_like,
+            "papaya_like": papaya_like,
+            "apple_like": apple_like,
             "classical_score": float(classical_score),
         }
 
@@ -346,17 +475,42 @@ class MangoIdentifier:
         if self.model is None:
             return None
 
-        rgb = processed["segmented_rgb"].astype(np.float32)
-        rgb = processed.get("model_segmented_rgb", rgb)
-        prediction = np.asarray(
-            self.model.predict(np.expand_dims(rgb, axis=0), verbose=0)
-        ).reshape(-1)
-        if prediction.size == 0:
-            return None
-        # Binary models may expose either sigmoid(1) or softmax(2).
-        if prediction.size == 1:
-            return float(prediction[0])
-        return float(prediction[-1])
+        sklearn_probability = None
+        if self.model_kind == "sklearn":
+            fast_processed = fast_identity_processed(processed["original"], self.input_size)
+            features = extract_identity_features(fast_processed).reshape(1, -1)
+            prediction = self.model.predict_proba(features)
+            sklearn_probability = float(prediction[0, -1])
+
+        if sklearn_probability is not None:
+            return sklearn_probability
+
+        if self.model_kind == "keras":
+            cnn_processed = self.cnn_preprocessor.preprocess(
+                processed["original"], mask_override=processed["mask"]
+            )
+            cnn_rgb = cnn_processed["model_segmented_rgb"].astype(np.float32)
+            segmented_prediction = np.asarray(
+                self.model.predict(np.expand_dims(cnn_rgb, axis=0), verbose=0)
+            ).reshape(-1)
+            raw_bgr = self.cnn_preprocessor.resize_image(processed["original"])
+            raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+            raw_prediction = np.asarray(
+                self.model.predict(np.expand_dims(raw_rgb, axis=0), verbose=0)
+            ).reshape(-1)
+            if segmented_prediction.size and raw_prediction.size:
+                segmented_probability = float(
+                    segmented_prediction[0]
+                    if segmented_prediction.size == 1
+                    else segmented_prediction[-1]
+                )
+                raw_probability = float(
+                    raw_prediction[0]
+                    if raw_prediction.size == 1
+                    else raw_prediction[-1]
+                )
+                return 0.70 * segmented_probability + 0.30 * raw_probability
+        return None
 
     def identify_objects(
         self,
@@ -377,6 +531,9 @@ class MangoIdentifier:
         analysis_image = full["original"]
         object_masks = self._split_object_masks(full["mask"])
         scene_object_count = len(object_masks)
+        object_areas = [cv2.countNonZero(item) for item in object_masks]
+        total_object_area = max(1, sum(object_areas))
+        dominant_object_share = max(object_areas) / total_object_area if object_areas else 0.0
         candidate_binary = np.where(
             full["candidate_mask"] > 0,
             255,
@@ -406,15 +563,17 @@ class MangoIdentifier:
         # components is usually foliage/background, not a clean mango scene.
         # Two or three components are still allowed for multiple mangoes.
         scene_clutter = (
-            scene_object_count > 3
+            (scene_object_count > 3 and dominant_object_share < 0.65)
             or (
                 candidate_component_count > 2
                 and substantial_candidate_count < 2
+                and dominant_object_share < 0.65
             )
         )
         objects = []
 
         for object_index, object_mask in enumerate(object_masks, start=1):
+            object_area = int(cv2.countNonZero(object_mask))
             x, y, width, height = cv2.boundingRect(object_mask)
             padding = max(4, int(round(0.08 * max(width, height))))
             x0 = max(0, x - padding)
@@ -432,41 +591,37 @@ class MangoIdentifier:
 
             if model_probability is None:
                 score = evidence["classical_score"]
-                method = "HSV + contour fallback"
-                accepted = (
-                    not evidence["round_orange"]
-                    and not evidence["round_warm_fruit"]
-                    and not evidence["round_red_fruit"]
-                    and not evidence["green_leaf_like"]
-                    and evidence["area_ratio"] >= 0.025
-                    and evidence["colour_ratio"] >= 0.35
-                    and score >= self.acceptance_threshold
-                    and not scene_clutter
-                )
+                method = "identity CNN unavailable - fail closed"
+                # Classical evidence is returned for diagnostics only. It is
+                # never allowed to identify an arbitrary uploaded image.
+                accepted = False
             else:
-                score = 0.75 * model_probability + 0.25 * evidence["classical_score"]
-                method = "binary CNN + HSV/contour evidence"
+                # The CNN is the species decision. Classical evidence adds
+                # conservative rejection checks for obvious look-alikes and
+                # fragmented scenes; it never rescues a weak CNN prediction.
+                score = 0.90 * model_probability + 0.10 * evidence["classical_score"]
+                method = "binary dataset gate + HSV/contour evidence"
                 accepted = (
-                    evidence["area_ratio"] >= 0.015
-                    and model_probability >= self.cnn_threshold
+                    model_probability >= self.cnn_threshold
                     and score >= self.acceptance_threshold
-                    # A yellow/green mango can satisfy the old round-yellow
-                    # rule, so colour alone must never reject a mango.  The
-                    # binary model is the species decision; this rule only
-                    # protects against the strongly citrus-like case.
                     and not evidence["round_orange"]
-                    and not evidence["round_warm_fruit"]
                     and not evidence["round_red_fruit"]
-                    and not evidence["green_leaf_like"]
+                    and not evidence["papaya_like"]
+                    and not evidence["apple_like"]
                     and not scene_clutter
                 )
 
             rejection_reasons = []
-            if evidence["area_ratio"] < (0.025 if model_probability is None else 0.015):
+            if model_probability is None:
+                rejection_reasons.append(
+                    "trained mango CNN is unavailable; species identification "
+                    "is disabled for safety"
+                )
+            if evidence["area_ratio"] < (0.025 if model_probability is None else 0.003):
                 rejection_reasons.append("foreground area is too small")
             if model_probability is not None and model_probability < self.cnn_threshold:
                 rejection_reasons.append(
-                    f"mango CNN probability is below {self.cnn_threshold:.0%}"
+                    f"mango model probability is below {self.cnn_threshold:.0%}"
                 )
             if score < self.acceptance_threshold:
                 rejection_reasons.append(
@@ -477,6 +632,8 @@ class MangoIdentifier:
                 ("round_warm_fruit", "round warm-colour object"),
                 ("round_red_fruit", "round red-fruit-like object"),
                 ("green_leaf_like", "leaf-like foreground shape"),
+                ("papaya_like", "papaya-like silhouette"),
+                ("apple_like", "apple-like silhouette"),
             ):
                 if evidence[flag]:
                     rejection_reasons.append(label)
@@ -488,6 +645,9 @@ class MangoIdentifier:
             objects.append({
                 "object_index": object_index,
                 "bbox": (x0, y0, x1 - x0, y1 - y0),
+                # Absolute mask area lets the UI choose the most prominent
+                # mango when several mango candidates are visible.
+                "foreground_area": object_area,
                 "crop": crop,
                 "processed": object_processed,
                 "mask": object_processed["mask"],
@@ -548,7 +708,7 @@ class MangoIdentifier:
                     "warm_aspect_ratio", "round_warm_fruit",
                     "warm_hue_median", "red_ratio", "round_red_fruit",
                     "yellow_ratio", "round_yellow_fruit", "green_ratio",
-                    "green_leaf_like",
+                    "green_leaf_like", "papaya_like", "apple_like",
                 )
             },
         }

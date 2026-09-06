@@ -1,0 +1,15 @@
+{
+  "model": "mango_identifier.keras",
+  "model_type": "MobileNetV2 binary CNN",
+  "input_size": [
+    224,
+    224
+  ],
+  "positive_label": "mango",
+  "negative_label": "non-mango",
+  "threshold": 0.85,
+  "test_accuracy": 0.9980670103092784,
+  "test_precision": 0.9651162790697675,
+  "test_recall": 1.0,
+  "epochs_trained": 3
+}
