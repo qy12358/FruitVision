@@ -9,3 +9,5 @@ scikit-learn
 matplotlib
 seaborn
 reportlab
+av
+streamlit-webrtc
