@@ -53,27 +53,19 @@ def render(history_df):
             h2.markdown(f"**Batch ID**  \n{record.get('batch_id') or 'Not specified'}")
             h3.markdown(f"**Date**  \n{created_text}")
 
-            report_text, pdf_report, report_error = report_data_from_record(record)
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    "Download report summary",
-                    data=report_text,
-                    file_name=f"{record['assessment_id']}_report.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                )
-            with d2:
-                st.download_button(
-                    "Export PDF",
-                    data=pdf_report or b"",
-                    file_name=f"{record['assessment_id']}_report.pdf",
-                    mime="application/pdf",
-                    disabled=pdf_report is None,
-                    use_container_width=True,
-                )
-                if report_error:
-                    st.caption(report_error)
+            _, pdf_report, report_error = report_data_from_record(record)
+
+            st.download_button(
+                "Export PDF",
+                data=pdf_report or b"",
+                file_name=f"{record['assessment_id']}_report.pdf",
+                mime="application/pdf",
+                disabled=pdf_report is None,
+                use_container_width=True,
+            )
+
+            if report_error:
+                st.caption(report_error)
 
             original = decode_png(record.get("original_image"), cv2.IMREAD_COLOR)
             processed = decode_png(record.get("processed_image"), cv2.IMREAD_COLOR)
