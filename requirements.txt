@@ -11,3 +11,4 @@ seaborn
 reportlab
 av
 streamlit-webrtc
+ultralytics
