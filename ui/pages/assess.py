@@ -88,12 +88,10 @@ def render(history_df):
 
     (
         upload_tab,
-        camera_tab,
         live_tab,
     ) = st.tabs(
         [
             "Upload a photo",
-            "Take a photo",
             "Live mango detection",
         ]
     )
@@ -113,17 +111,6 @@ def render(history_df):
                 "webp",
             ],
             key="assessment_upload",
-        )
-
-    # ============================================================
-    # TAKE PHOTO
-    # ============================================================
-
-    with camera_tab:
-
-        use_camera = st.camera_input(
-            "Take a clear photo of the mango",
-            key="assessment_camera",
         )
 
     # ============================================================
@@ -197,33 +184,6 @@ def render(history_df):
             st.error(
                 "The uploaded image could not be opened. "
                 "Please choose another JPG, PNG or WebP image."
-            )
-
-        else:
-
-            image_ready = True
-
-            source_fingerprint = hashlib.sha256(
-                source_bytes
-            ).hexdigest()
-
-    # ============================================================
-    # PRIORITY 3 — TAKE PHOTO
-    # ============================================================
-
-    elif use_camera is not None:
-
-        source_bytes = use_camera.getvalue()
-
-        image = decode_uploaded_image(source_bytes)
-
-        source_type = "camera"
-
-        if image is None:
-
-            st.error(
-                "The camera photo could not be opened. "
-                "Please take another photo."
             )
 
         else:
@@ -330,14 +290,6 @@ def render(history_df):
                 )
 
         # --------------------------------------------------------
-        # CAMERA CAPTION
-        # --------------------------------------------------------
-
-        elif source_type == "camera":
-
-            caption = "Camera photo"
-
-        # --------------------------------------------------------
         # UPLOAD CAPTION
         # --------------------------------------------------------
 
@@ -365,10 +317,7 @@ def render(history_df):
 
     normal_analyse_clicked = False
 
-    if source_type in (
-        "upload",
-        "camera",
-    ):
+    if source_type == "upload":
 
         normal_analyse_clicked = st.button(
             "Analyse mango",
@@ -527,8 +476,7 @@ def render(history_df):
         empty_state(
             "Add a mango photo to begin",
             (
-                "Upload a photo, take a photo, "
-                "or use live mango detection."
+                "Upload a photo or use live mango detection."
             ),
         )
 
