@@ -3,11 +3,9 @@ numpy
 pandas
 Pillow
 opencv-python-headless
-matplotlib
-scikit-learn
-tensorflow
-ultralytics
-reportlab
 plotly
-av
-streamlit-webrtc
+tensorflow
+scikit-learn
+matplotlib
+seaborn
+reportlab
